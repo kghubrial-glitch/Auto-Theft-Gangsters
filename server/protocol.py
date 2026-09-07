@@ -1040,25 +1040,30 @@ def encode_damage_board(entries: list) -> bytes:
 
 
 def encode_drop_item_info(server_id: int, item_id: int, count: int,
-                          pos_x: int, pos_z: int) -> bytes:
-    """SprotoType.drop_item_info: {serverId(0) int, pos_x(1) int,
-    pos_z(2) int, type(3) int, item(4): SprotoType.item object,
-    ownServerId(7) int}. SprotoType.item: {itemId(0) STRING, itemCount(1),
-    quality(3), id(4) STRING, count2(5)} — itemId must be the REAL ItemData
-    row id as a string, or GetItemDataByID returns null and the client
-    crashes (drop_item_info_handler dereferences itemDataByID.Type).
+                          pos_x: int, pos_z: int) -> dict:
+    """SprotoType.drop_item_info push BODY (flat, not wrapped in {0: blob}):
+    {serverId(0) int, pos_x(1) int, pos_z(2) int, type(3) int,
+    item(4): SprotoType.item object, ownServerId(7) int}. The client's
+    drop_item_info.request class decodes these tags directly off the push
+    body — wrapping the object at tag 0 makes the client read a
+    length-prefixed field as serverId ("read invalid integer size"), which
+    kills the packet pump. SprotoType.item: {itemId(0) STRING,
+    itemCount(1), quality(3), id(4) STRING, count2(5)} — itemId must be the
+    REAL ItemData row id as a string, or GetItemDataByID returns null and
+    the client crashes (drop_item_info_handler dereferences
+    itemDataByID.Type).
     """
     item = _enc.encode_object({
         0: str(item_id), 1: count,
     })
-    return _enc.encode_object({
+    return {
         0: server_id,
         1: int(pos_x * 100),
         2: int(pos_z * 100),
         3: 0,                 # type
         4: item,
         7: server_id,         # ownServerId
-    })
+    }
 
 
 def encode_shop_good(goods_id: int, item_id: int, count: int,

@@ -370,18 +370,21 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         # kick off the server-driven world entry (enter_map push)
         self._begin_world_entry(s, row)
 
+    def _push_main_player_create(self, s: Session, wp) -> None:
+        s.push(P.MAIN_PLAYER_CREATE, {0: W.encode_main_player_create(
+            wp, skills=[(r["skill_id"], r["level"])
+                        for r in self.server.db.list_skills(wp.char_id)])})
+
     async def h_map_ready(self, s: Session, msg) -> None:
-        # Client finished loading the map scene (sent after our enter_map
-        # push). Deliver the world contents: own player, then everyone
-        # already here, then the map NPCs.
+        # Client finished loading the map scene (sent after our enter_map +
+        # main_player_create pushes). The main player is already spawned by
+        # then (main_player_create was buffered during the scene load), so
+        # here we only deliver everyone already on the map + the map NPCs.
         wp = getattr(s, "pending_world_player", None)
         if wp is None:
             return
         s.pending_world_player = None
         s.world_player = wp
-        s.push(P.MAIN_PLAYER_CREATE, {0: W.encode_main_player_create(
-            wp, skills=[(r["skill_id"], r["level"])
-                        for r in self.server.db.list_skills(wp.char_id)])})
         for other in self.server.world.others(wp.map_id, wp.char_id):
             s.push(P.AOI_ADD, {0: W.encode_aoi_add(other)})
         for npc in self.server.world.npcs_in(wp.map_id):
@@ -397,12 +400,20 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
     def _begin_world_entry(self, s: Session, row) -> None:
         """Start the server-driven world entry for a picked character.
 
-        Real client flow (NetReceiver): the SERVER pushes enter_map(503)
-        {mapInfoId, line_index, line_count}; the client loads the map scene
-        and answers with map_ready(100); the server then pushes
-        main_player_create(504) + the aoi/npc bursts. enter_map has no
-        request schema — a server that waits for the client to request it
-        deadlocks the loading widget.
+        Real client flow (NetReceiver / LoadingUIRoot / ObjManager):
+        the SERVER pushes enter_map(503) {mapInfoId, line_index,
+        line_count} and then main_player_create(504) immediately after.
+        enter_map makes the client stop processing frames
+        (NetLogic.CanProcessPack = false in enter_map_handler) and load the
+        map scene; the buffered main_player_create is processed once the
+        scene's SceneController.Awake re-enables the packet pump, spawning
+        the main player (ObjManager.CreateMainPlayer ->
+        GameManager.IsSceneReady = true). Only THEN does the loading bar
+        pass 90% (LoadingUIRoot caps it at 0.9 while !IsSceneReady), fire
+        OnLoadingOver and send map_ready(100) — so a server that waits for
+        map_ready before sending main_player_create deadlocks the loading
+        screen at exactly 90% with only the BGM playing. The aoi/npc bursts
+        go out after map_ready, when the scene is truly ready for them.
         """
         # 0 means "never entered the world yet"; fall back to the main city.
         # NEVER default to map "1" — in the client's MapInfoData table that is
@@ -423,6 +434,12 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             1: 0,               # line_index
             2: 1,               # line_count
         })
+        # main_player_create MUST follow enter_map right away: the client
+        # buffers it while the scene loads and spawns the player from it
+        # (which is what releases the 90% loading cap). Sending it only
+        # after map_ready deadlocks — the client never sends map_ready
+        # before its main player exists.
+        self._push_main_player_create(s, wp)
 
     async def h_enter_map(self, s: Session, msg) -> None:
         # Legacy request form (tests / reconnect helpers). The real client
@@ -1038,10 +1055,14 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         s.respond(msg, {0: 0})
         for item_id, cnt in drops.items():
             db.add_item(wp.char_id, item_id, cnt)
+            # drop_item_info's body IS the flat SprotoType.drop_item_info
+            # object (serverId/pos_x/pos_z/type/item/ownServerId) — wrapping
+            # it in {0: blob} makes the real client throw on decode and
+            # freeze the moment loot drops.
             self.server.world.broadcast(
                 wp.map_id, P.DROP_ITEM_INFO,
-                {0: P.encode_drop_item_info(npc_id, item_id, cnt,
-                                            npc.pos["x"], npc.pos["z"])})
+                P.encode_drop_item_info(npc_id, item_id, cnt,
+                                        npc.pos["x"], npc.pos["z"]))
         if gold:
             db.add_currency(wp.char_id, economy.CURRENCY_GOLD, gold)
         level, exp_left = db.add_exp(wp.char_id, exp)

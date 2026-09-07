@@ -119,7 +119,7 @@ Key tags used in the revival server:
 |   3 | `verfiy` | C→S / S→C | verify account: req `{id,key,versionCode}`, resp `{state,session,game_server[],...}` |
 |   4 | `login` | C→S / S→C | game login: req `{session,id,logintype,version,unityVersion,serverId,time}`, resp `{type,versionCode,dataVersionCode,serverLevel}` |
 |   7 | `update_game_server` | C→S / S→C | refresh game-server list: resp `{game_server[]}` |
-| 100 | `map_ready` | C→S | client finished loading map |
+| 100 | `map_ready` | C→S | client finished loading map (sent only AFTER its main player spawned) |
 | 101 | `move` | C→S | player movement `{pos:{x,y,z,o}, moving, index, parm}` |
 | 102 | `skill_use` | C→S | use skill |
 | 103 | `character_list` | C→S / S→C | list characters: resp `{character[]}` |
@@ -131,7 +131,8 @@ Key tags used in the revival server:
 | 280 | `update_client_state` | C→S / S→C | client/server state sync |
 | 281 | `refresh_online_state` | C→S | re-entered online state `{id,type,mapId}` |
 | 308 | `game_check` | C→S | game guard check |
-| 503 | `enter_map` | C→S | enter map `{mapInfoId,line_index,line_count}` |
+| 503 | `enter_map` | S→C push | server tells the client to load map `{mapInfoId,line_index,line_count}` (a legacy C→S form also exists) |
+| 504 | `main_player_create` | S→C push | spawn the main player `{character, movement}` — must be pushed immediately after `enter_map` |
 | 578 | `login_max_count` | S→C | server full (kick) |
 | 660 | `retrieve_account` | C→S | account recovery |
 
@@ -161,10 +162,15 @@ player taps Login
     │
     ├─ CharacterListRequest()  → character_list.response {character[]}
     ├─ Select/create character
-    ├─ character_pick.request{id} → resp{errno}
-    ├─ map loading; send Protocol.map_ready (100)
-    ├─ enter_map.request{mapInfoId,line_index,line_count}  (server confirms / pushes AOI)
-    └─ in-world: move/chat/heart_beat(15s/aoi sync...
+    ├─ character_pick.request{id} → resp{} (empty body on success)
+    ├─ (push) enter_map{mapInfoId,line_index,line_count}  → client loads the
+    │       map scene and STOPS processing frames (NetLogic.CanProcessPack=false)
+    ├─ (push) main_player_create{character,movement}  → buffered during the
+    │       scene load, processed when SceneController.Awake re-enables the
+    │       packet pump → ObjManager.CreateMainPlayer → IsSceneReady=true →
+    │       loading bar passes 90% → OnLoadingOver
+    ├─ map_ready (100) sent by the client  (server answers with the AOI/NPC burst)
+    └─ in-world: move/chat/heart_beat(15s)/aoi sync...
 ```
 
 ## 9. Game server list (`SprotoType.game_server` — fields
