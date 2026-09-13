@@ -341,7 +341,8 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         row = self.server.db.create_character(
             s.account_id or 0, name, sex=sex, profession=profession,
             level=economy.TEST_MAX_LEVEL,
-            extra={"gold": economy.TEST_START_GOLD,
+            extra={"cash": economy.TEST_START_CASH,
+                   "gold": economy.TEST_START_GOLD,
                    "diamond": economy.TEST_START_DIAMOND})
         if row is None:
             s.respond(msg, {1: 1})  # errno: name taken
@@ -354,24 +355,24 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         start_weapon = (profession + 1) * 10000 + 1
         char_id = row["id"]
         if start_weapon in economy.ITEMS:
-            self.server.db.add_item(char_id, start_weapon, 1)
+            self.server.db.add_item(char_id, start_weapon, 1, seen=1)
             self.server.db.set_equipped(char_id, 0, start_weapon)
         # Real tier-1 armor per profession: helmet(2)/chest(3)/legs(4)/
         # belt(5)/necklace(6) -> db slots 1..5.
         for slot, item_id in economy.starter_armor(profession):
-            self.server.db.add_item(char_id, item_id, 1)
+            self.server.db.add_item(char_id, item_id, 1, seen=1)
             self.server.db.set_equipped(char_id, slot, item_id)
         # starter badge lives in its dedicated slot (8) so it never collides
         # with the six real equip slots
         for _slot, item_id in economy.STARTER_GEAR:
             if item_id in economy.ITEMS:
-                self.server.db.add_item(char_id, item_id, 1)
+                self.server.db.add_item(char_id, item_id, 1, seen=1)
                 self.server.db.set_equipped(char_id,
                                             economy.BADGE_DB_SLOT, item_id)
         # EVERY new account gets the full fashion wardrobe (usable
         # immediately via the player-model page: equip/unequip + show/hide)
         for fashion_id in economy.ALL_FASHION_IDS:
-            self.server.db.add_item(char_id, fashion_id, 1)
+            self.server.db.add_item(char_id, fashion_id, 1, seen=1)
         # the class's real skill bar: x01 = basic attack (indexPos 3, the
         # client's basic-attack slot), the remaining five skills from the
         # 6-skill pool fill the two switch groups (indexPos 4..6 / 7..9 —
@@ -444,7 +445,7 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         # (add_item caps at 1 per fashion id via count)
         for fashion_id in economy.ALL_FASHION_IDS:
             if self.server.db.get_item_count(row["id"], fashion_id) < 1:
-                self.server.db.add_item(row["id"], fashion_id, 1)
+                self.server.db.add_item(row["id"], fashion_id, 1, seen=1)
         self._sync_backpack(s, row["id"])
         self._sync_item_pack(s, row["id"])
         self._sync_badges(s, row["id"])
@@ -564,6 +565,14 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
                 fashion_item = item_id
         wp.weapon_item_id = str(weapon_item) if weapon_item else None
         wp.fashion_item_id = str(fashion_item) if fashion_item else None
+        wallet = {
+            "cash": self.server.db.get_currency(wp.char_id,
+                                                economy.CURRENCY_CASH),
+            "gold": self.server.db.get_currency(wp.char_id,
+                                                economy.CURRENCY_GOLD),
+            "diamond": self.server.db.get_currency(wp.char_id,
+                                                   economy.CURRENCY_DIAMOND),
+        }
         s.push(P.MAIN_PLAYER_CREATE, W.encode_main_player_create(
             wp, skills=[(r["skill_id"], r["level"], r["index_pos"])
                         for r in self.server.db.list_skills(wp.char_id)],
@@ -571,7 +580,7 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             attrs=self.server.db.load_attributes(wp.char_id) or None,
             hp=self.server.db.get_hp(wp.char_id)[1],
             badge_equips=badge_equips, fashion_equips=fashion_equips,
-            show_type=show_type))
+            show_type=show_type, **wallet))
 
     async def h_enter_map(self, s: Session, msg) -> None:
         # Legacy request form (tests / reconnect helpers). The real client
@@ -601,7 +610,13 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
                         for r in self.server.db.list_skills(row["id"])],
             equips=self._equipped_wire_items(row["id"]),
             attrs=self.server.db.load_attributes(row["id"]) or None,
-            hp=self.server.db.get_hp(row["id"])[1]))
+            hp=self.server.db.get_hp(row["id"])[1],
+            cash=self.server.db.get_currency(row["id"],
+                                             economy.CURRENCY_CASH),
+            gold=self.server.db.get_currency(row["id"],
+                                             economy.CURRENCY_GOLD),
+            diamond=self.server.db.get_currency(row["id"],
+                                                economy.CURRENCY_DIAMOND)))
         for other in self.server.world.others(map_id, row["id"]):
             s.push(P.AOI_ADD, {0: W.encode_aoi_add(other)})
         for npc in self.server.world.npcs_in(map_id):
@@ -794,7 +809,10 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         # sync_backpack_item(592) decodes map<indexId, gameitem> and only
         # updates entries found by indexId (or the first empty slot) — every
         # element must be a FULL gameitem blob or the bag renders empty.
-        # Container: ITEM_CONTAINER_TYPE.EQUIP_BACKPACK = 0.
+        # Container: ITEM_CONTAINER_TYPE.EQUIP_BACKPACK = 0 — the client's
+        # "equipment" bag tab. It must ONLY carry equipment (ITEM_TYPE.EQUIP):
+        # fashions go to the FASHION_BACKPACK via sync_fashion_backpack_item,
+        # badges to BADGE_BACKPACK, and consumables/others to ITEM_BACKPACK.
         # EXCLUDE equipped items: the client's equipment tab reads the
         # EQUIPPACK, but the bag grid shows every EQUIP_BACKPACK entry —
         # a worn piece that also appears here renders as a duplicate
@@ -803,13 +821,16 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
                         self.server.db.list_equipped(char_id)}
         rows = [r for r in self.server.db.list_items(char_id)
                 if r["item_id"] not in equipped_ids]
-        instances = {i["item_id"]: i for i in
-                     self.server.db.list_instances(char_id)}
+        instance_map = {i["item_id"]: i for i in
+                        self.server.db.list_instances(char_id)}
         blobs = []
         for r in rows:
-            blob = P.encode_backpack_gameitem(
-                r, instances.get(r["item_id"]))
-            blobs.append(blob)
+            idef = economy.ITEMS.get(r["item_id"], {})
+            if idef.get("type") not in ("equipment",):
+                continue
+            blobs.append(P.encode_backpack_gameitem(
+                r, instance_map.get(r["item_id"]),
+                seen=r["seen"] if "seen" in r.keys() else 1))
         s.push(P.SYNC_BACKPACK_ITEM, {0: sproto.encode_object_array(blobs)})
 
     def _check_auto_complete(self, s: Session, char_id: int,
@@ -909,7 +930,7 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         # auto-accepts its NextID from its local table (SyncMissionList),
         # then the accept_mission RPC moves the cursor forward.
         self._sync_missions(s, char_id)
-        self._sync_backpack(s, char_id)
+        self._sync_all_containers(s, char_id)
         log.info("char %d completed mission %s", char_id, mission_id)
 
     async def h_abandon_mission(self, s: Session, msg) -> None:
@@ -950,11 +971,11 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             s.respond(msg, {0: 2})   # not enough items
             return
         self.server.db.add_item(char_id, item_id, -count)
-        s.respond(msg, {0: 0})
-        # update_item {containertype=ITEM_BACKPACK(2), indexId, NO gameitem}
-        # RESETS the old stack in the client's container; the fresh
-        # container sync below re-adds the exact remaining stack.
-        s.push(P.UPDATE_ITEM, {0: P.CONTAINER_ITEM_BACKPACK, 1: item_id})
+        # ret_use_item {success(0), indexId(1)} — the client decrements the
+        # stack it used and shows the effect; indexId must be echoed or the
+        # handler's GetItemByIndexId(-1) mis-clears a bag slot.
+        s.respond(msg, {0: 0, 1: raw if isinstance(raw, int) else item_id})
+        self._sync_item_pack(s, char_id)
         self._sync_backpack(s, char_id)
 
     async def h_sell_item(self, s: Session, msg) -> None:
@@ -987,10 +1008,14 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         gold = 500 * count
         new_gold = db.add_currency(char_id, economy.CURRENCY_GOLD, gold)
         s.respond(msg, {0: 0})
-        # reset the recycled stack in the client's ITEM_BACKPACK, then the
-        # container sync re-adds whatever remains
-        s.push(P.UPDATE_ITEM, {0: P.CONTAINER_ITEM_BACKPACK, 1: item_id})
-        self._sync_backpack(s, char_id)
+        # resync the affected containers: the recycled stack leaves the
+        # client's ITEM_BACKPACK, and an equipped instance (if any) was
+        # removed from the model/backpack simultaneously
+        idef = economy.ITEMS.get(item_id, {})
+        if idef.get("type") == "equipment":
+            self._sync_backpack(s, char_id)
+        else:
+            self._sync_item_pack(s, char_id)
         self._recalc_and_sync(s, char_id)
 
     # ------------------------------------------------------------------
@@ -1031,9 +1056,20 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         db.add_currency(char_id, good["currency"], -total)
         new_count = db.add_item(char_id, good["item_id"], good["count"] * count)
         s.respond(msg, {0: 0})
-        s.push(P.UPDATE_ITEM, {0: P.CONTAINER_ITEM_BACKPACK,
-                               1: good["item_id"]})
-        self._sync_backpack(s, char_id)
+        # resync whichever bag container the bought item belongs to (the
+        # client's bag tabs are split by ITEM_TYPE — equipment, consumables,
+        # badges and fashions each have their own container)
+        bought_type = economy.ITEMS.get(good["item_id"], {}).get("type")
+        if bought_type == "equipment":
+            self._sync_backpack(s, char_id)
+        elif bought_type == "badge":
+            self._sync_badges(s, char_id)
+        elif bought_type == "fashion":
+            self._sync_fashion(s, char_id)
+        else:
+            self._sync_item_pack(s, char_id)
+        # update the client's wallet so the shop UI reflects the spend
+        self._recalc_and_sync(s, char_id)
         self._progress_buy_missions(s, char_id, good["item_id"], good["count"] * count)
         log.info("char %d bought goods %d x%d for %d", char_id, goods_id,
                  count, total)
@@ -1073,13 +1109,26 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         """Return the persisted instance for an equipped item, rolling one
         ONLY if the slot has no instance yet (first equip). The rolled
         quality/attrs/skill are stored on item_instances and stay with the
-        item for the item's lifetime — never re-rolled at login."""
+        item for the item's lifetime — never re-rolled at login.
+
+        Reusing the OWNED instance across equip/unequip is what keeps the
+        item's identity stable: unequip clears the slot row but must not
+        destroy the rolled instance, so a re-equip of the same item picks
+        up the existing (character, item) instance instead of rolling a
+        brand-new one."""
         db = self.server.db
         index_id = db.get_equipped_index(char_id, slot)
         if index_id is not None:
             inst = db.get_instance(index_id)
             if inst is not None and inst["item_id"] == item_id:
                 return inst
+        # re-equipping an item that was previously unpacked: reuse the
+        # character's existing (character, item_id) instance if one exists
+        existing = db.find_instances(char_id, item_id)
+        if existing:
+            inst = existing[0]
+            db.set_equipped(char_id, slot, item_id, inst["index_id"])
+            return inst
         is_weapon = idef.get("slot") == 0 or "weapon_class" in idef
         if is_weapon:
             quality, attrs = economy.roll_weapon_instance(item_id)
@@ -1118,7 +1167,8 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
     @staticmethod
     def _push_item_update(s: Session, index_id: int, item_id: int,
                           container: int = None, quality: int = None,
-                          level: int = 0, attrs: list = None) -> None:
+                          level: int = 0, attrs: list = None,
+                          seen: int = 1) -> None:
         """update_item(525): {containertype(0), indexId(1), gameitem(2)}.
 
         The client's update_item_handler updates the GameItem found by
@@ -1131,10 +1181,13 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
                 else P.CONTAINER_EQUIP_BACKPACK,   # EQUIP_BACKPACK = 0
                 1: index_id}
         if item_id is not None:
+            # parm[5]=1 keeps the re-added item from looking "new" — the
+            # item is re-entering a bag slot the client may have just Reset.
             body[2] = P.encode_gameitem(
                 index_id, item_id, stack=1,
                 quality=quality if quality is not None else 2,
-                level=level, random_attris=attrs)
+                level=level, random_attris=attrs,
+                parm=[0, 0, 0, 0, 0, (0 if not seen else 1), 0, 0])
         s.push(P.UPDATE_ITEM, body)
 
     def _sync_equip_change(self, s: Session, char_id: int,
@@ -1186,15 +1239,18 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         gold = self.server.db.get_currency(char_id, economy.CURRENCY_GOLD)
         diamond = self.server.db.get_currency(char_id,
                                               economy.CURRENCY_DIAMOND)
+        cash = self.server.db.get_currency(char_id, economy.CURRENCY_CASH)
         s.push(P.AOI_UPDATE_ATTRIBUTE, {0: P.encode_aoi_update_attribute(
-            char_id, hp, exp, level, max_hp, gold, diamond,
+            char_id, hp, exp, level, max_hp, gold, diamond, cash=cash,
             attrs=attrs, comb_value=attrs.get("power", 0))})
 
     def _sync_badges(self, s: Session, char_id: int) -> None:
         # sync_badgepack_item(604) fills the BADGE_BACKPACK container (3).
         badges = [item for item in self.server.db.list_items(char_id)
                   if economy.ITEMS.get(item["item_id"], {}).get("type") == "badge"]
-        blobs = [P.encode_backpack_gameitem(r) for r in badges]
+        blobs = [P.encode_backpack_gameitem(
+            r, seen=r["seen"] if "seen" in r.keys() else 1)
+            for r in badges]
         s.push(P.SYNC_BADGEPACK_ITEM, {0: sproto.encode_object_array(blobs)})
 
     def _sync_fashion(self, s: Session, char_id: int) -> None:
@@ -1202,7 +1258,9 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         # container (5) — full gameitem blobs required.
         fashion = [item for item in self.server.db.list_items(char_id)
                    if economy.ITEMS.get(item["item_id"], {}).get("type") == "fashion"]
-        blobs = [P.encode_backpack_gameitem(r) for r in fashion]
+        blobs = [P.encode_backpack_gameitem(
+            r, seen=r["seen"] if "seen" in r.keys() else 1)
+            for r in fashion]
         s.push(P.SYNC_FASHION_BACKPACK_ITEM,
                {0: sproto.encode_object_array(blobs)})
 
@@ -1220,8 +1278,17 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             if idef.get("type") in ("equipment", "badge", "fashion"):
                 continue
             blobs.append(P.encode_backpack_gameitem(
-                r, instances.get(r["item_id"])))
+                r, instances.get(r["item_id"]),
+                seen=r["seen"] if "seen" in r.keys() else 1))
         s.push(P.SYNC_ITEM_PACK, {0: sproto.encode_object_array(blobs)})
+
+    def _sync_all_containers(self, s: Session, char_id: int) -> None:
+        """Full container resync (all four bag tabs) after item grants that
+        could touch any ITEM_TYPE."""
+        self._sync_backpack(s, char_id)
+        self._sync_item_pack(s, char_id)
+        self._sync_badges(s, char_id)
+        self._sync_fashion(s, char_id)
 
     def _sync_show_type(self, s: Session, char_id: int,
                         show_type: int) -> None:
@@ -1459,7 +1526,11 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             db.add_item(char_id, iid, cnt)
             stacks.append(P.encode_item_stack(iid, cnt))
         s.respond(msg, {0: 0, 1: sproto.encode_object_array(stacks)})
+        # resync every container that may have gained an item from the box
         self._sync_backpack(s, char_id)
+        self._sync_item_pack(s, char_id)
+        self._sync_badges(s, char_id)
+        self._sync_fashion(s, char_id)
         # chest contents can include gear whose instances change the
         # attribute set? (instances roll at equip time) — recalc keeps
         # power in sync after reward pickups regardless.
@@ -1489,6 +1560,7 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         db.add_item(char_id, item_id, -count)
         db.add_storage(char_id, item_id, count)
         s.respond(msg, {0: 0})
+        self._sync_item_pack(s, char_id)
         self._sync_backpack(s, char_id)
 
     async def h_take_item_storagepack(self, s: Session, msg) -> None:
@@ -1506,6 +1578,7 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         db.add_storage(char_id, item_id, -count)
         db.add_item(char_id, item_id, count)
         s.respond(msg, {0: 0})
+        self._sync_item_pack(s, char_id)
         self._sync_backpack(s, char_id)
 
     async def h_request_random_name(self, s: Session, msg) -> None:
@@ -1518,14 +1591,25 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         s.respond(msg, {0: name})
 
     async def h_change_item_state(self, s: Session, msg) -> None:
-        # state toggle (e.g. lock item) — acknowledged, stored in progress
+        # The client acknowledges a newly-acquired item by sending
+        # {indexId, containerType} (ItemUILogic.OnClickItem) — the server
+        # records it so future re-syncs (re-login, unequip re-add) keep the
+        # item "seen" instead of showing the new flag again.
         row = self._require_char(s)
         if row is None:
             s.respond(msg, {0: 1})
             return
-        item_id = msg.body.get(0)
+        char_id = row["id"]
+        index_id = msg.body.get(0)
         state = msg.body.get(1, 0)
-        self.server.db.set_progress(row["id"], "item_state_%d" % item_id, state)
+        if isinstance(index_id, int):
+            self.server.db.set_progress(
+                char_id, "item_state_%d" % index_id, state)
+            # resolve the item_id behind the index_id (instance or stack id)
+            inst = self.server.db.get_instance(index_id)
+            item_id = inst["item_id"] if inst else index_id
+            if item_id in economy.ITEMS:
+                self.server.db.mark_item_seen(char_id, item_id)
         s.respond(msg, {0: 0})
 
     # ------------------------------------------------------------------
@@ -1632,6 +1716,9 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             db.add_currency(wp.char_id, economy.CURRENCY_GOLD, gold)
         level, exp_left = db.add_exp(wp.char_id, exp)
         gold_total = db.get_currency(wp.char_id, economy.CURRENCY_GOLD)
+        cash_total = db.get_currency(wp.char_id, economy.CURRENCY_CASH)
+        diamond_total = db.get_currency(wp.char_id,
+                                        economy.CURRENCY_DIAMOND)
         hp, max_hp = db.get_hp(wp.char_id)
         # aoi_update_attribute is the client's real exp/level/hp/money sync
         # (ExpLineRootLogic.UpdateExp). A kill grants exp — a change event —
@@ -1639,8 +1726,10 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         attrs = economy.recalc_character(db, wp.char_id)
         s.push(P.AOI_UPDATE_ATTRIBUTE, {0: P.encode_aoi_update_attribute(
             wp.char_id, hp, exp_left, level, max_hp, gold_total,
+            diamond_total, cash=cash_total,
             attrs=attrs, comb_value=attrs.get("power", 0))})
-        self._sync_backpack(s, wp.char_id)
+        # loot drops can be consumables OR gear — resync every bag tab
+        self._sync_all_containers(s, wp.char_id)
         # Count the kill towards active kill-type missions (main-chain
         # KILL_TARGET_NPC/KILLMONSTER and side missions) while the NPC is
         # still registered dead; the respawn runs right after.
@@ -1955,7 +2044,15 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         db.add_guild_gold(g["id"], -good["price"])
         db.add_item(row["id"], good["item_id"], good["count"])
         s.respond(msg, {0: 0})
-        self._sync_backpack(s, row["id"])
+        gtype = economy.ITEMS.get(good["item_id"], {}).get("type")
+        if gtype == "equipment":
+            self._sync_backpack(s, row["id"])
+        elif gtype == "fashion":
+            self._sync_fashion(s, row["id"])
+        elif gtype == "badge":
+            self._sync_badges(s, row["id"])
+        else:
+            self._sync_item_pack(s, row["id"])
 
     async def h_guild_log(self, s: Session, msg) -> None:
         row, g = self._require_guild(s)
