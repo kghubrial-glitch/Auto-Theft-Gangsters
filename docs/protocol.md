@@ -130,6 +130,7 @@ Key tags used in the revival server:
 | 234 | `leave_game` | C→S | logout |
 | 280 | `update_client_state` | C→S / S→C | client/server state sync |
 | 281 | `refresh_online_state` | C→S | re-entered online state `{id,type,mapId}` |
+| 303 | `equip_appraise` | C→S / S→C | identify/unlock equipment: req `{index=indexId}`, resp `{ret}` |
 | 308 | `game_check` | C→S | game guard check |
 | 503 | `enter_map` | C→S | enter map `{mapInfoId,line_index,line_count}` |
 | 578 | `login_max_count` | S→C | server full (kick) |

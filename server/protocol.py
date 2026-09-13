@@ -97,6 +97,10 @@ EQUIP_BADGE = 197
 UNEQUIP_BADGE = 198
 EQUIP_FASHION_ITEM = 221
 UNEQUIP_FASHION_ITEM = 222
+# equip_appraise (303): the client's Appraise button
+# (AppraiseRootLogic.OnClickAppraiseBtn) sends {indexId(0)} to
+# identify/unlock a freshly acquired equipment item.
+EQUIP_APPRAISE = 303
 OPEN_ITEM_PACKAGE = 224
 RET_OPEN_ITEM_PACKAGE = 617
 REQUEST_UPDATE_STORAGEPACK = 139
@@ -387,6 +391,7 @@ TAG_NAMES = {
     UNEQUIP_BADGE: "unequip_badge",
     EQUIP_FASHION_ITEM: "equip_fashion_item",
     UNEQUIP_FASHION_ITEM: "unequip_fashion_item",
+    EQUIP_APPRAISE: "equip_appraise",
     OPEN_ITEM_PACKAGE: "open_item_package",
     RET_OPEN_ITEM_PACKAGE: "ret_open_item_package",
     REQUEST_UPDATE_STORAGEPACK: "request_update_storagepack",
@@ -696,6 +701,7 @@ REQUEST_SPECS = {
     UNEQUIP_BADGE: {0: "i"},       # indexId
     EQUIP_FASHION_ITEM: {0: "i"},  # indexId
     UNEQUIP_FASHION_ITEM: {0: "i"},  # indexId
+    EQUIP_APPRAISE: {0: "i"},      # indexId (equip_appraise.request.index)
     OPEN_ITEM_PACKAGE: {0: "i"},   # item id of the package
     PUT_ITEM_STORAGEPACK: {0: "i", 1: "i"},   # item id, count
     TAKE_ITEM_STORAGEPACK: {0: "i", 1: "i"},  # item id, count
@@ -835,6 +841,9 @@ RESPONSE_SPECS = {
     UNEQUIP_BADGE: {0: "i"},
     EQUIP_FASHION_ITEM: {0: "i"},
     UNEQUIP_FASHION_ITEM: {0: "i"},
+    # equip_appraise response: {ret(0)} — the client's AppraiseRootLogic
+    # sends no response handler; the errno-style int body is all it needs.
+    EQUIP_APPRAISE: {0: "i"},
     # equip/unequip responses have NO push type: the decompiled client
     # dispatches them by session only, with an errno-style int body.
     RET_OPEN_ITEM_PACKAGE: {0: "i", 1: "oa"},
@@ -1169,6 +1178,11 @@ def encode_backpack_gameitem(char_id_row, instance=None,
     `seen` drives gameitem.parm[5] — the client's "new item" flag (0=new).
     Persisted/known items must send seen=1 or every re-sync (including the
     re-add after unequip) makes the item look freshly acquired again.
+
+    `appraise` (gameitem field 8) rides the INSTANCE's persisted state:
+    existing/owned equipment is always appraised (usable directly), while a
+    genuine new drop that has not been identified stays appraised=0 so the
+    client shows the Appraise page.
     """
     from . import economy
     item_id = char_id_row["item_id"]
@@ -1187,14 +1201,15 @@ def encode_backpack_gameitem(char_id_row, instance=None,
         return encode_gameitem(instance["index_id"], item_id, stack=1,
                                quality=instance["quality"],
                                level=instance["level"], random_attris=attrs,
-                               parm=parm)
+                               parm=parm,
+                               appraise=instance.get("appraise", 1))
     if idef.get("type") == "equipment" and item_id in economy.ARMOR_ITEMS:
         # armor without a rolled instance yet: plain quality, no attrs
         return encode_gameitem(item_id, item_id, stack=1, quality=1,
-                               parm=parm)
+                               parm=parm, appraise=1)
     quality = 2 if idef.get("type") == "equipment" else 0
     return encode_gameitem(item_id, item_id, stack=count, quality=quality,
-                           parm=parm)
+                           parm=parm, appraise=1)
 
 
 def encode_acceptdamge(obj_id: int, damage: int, skill_id: str = "1",
@@ -1458,7 +1473,8 @@ def encode_gameitem(index_id: int, item_id: int, stack: int = 1,
                     quality: int = 2, level: int = 0,
                     bind: bool = True,
                     random_attris: list = None,
-                    parm: list = None) -> bytes:
+                    parm: list = None,
+                    appraise: int = 1) -> bytes:
     """SprotoType.gameitem, the REAL inventory element (decode() switch):
     indexId(0) i, itemId(1) STRING, bindflag(2) b, level(3) i, flags(4) i,
     stack(5) i, quality(6) i, parm(7) int-list, appraise(8) i,
@@ -1469,6 +1485,12 @@ def encode_gameitem(index_id: int, item_id: int, stack: int = 1,
     or [(index, id, value, quality, skillId)] list; random_attri:
     index(0) i, id(1) i, value(2) i, quality(3) i, skillId(4) s,
     qualityId(5) s.
+
+    `appraise` is gameitem.appraise (field 8): 0 = unidentified (the
+    client shows the Appraise page and blocks direct equipping),
+    1 = identified/unlocked. The client's GameItem.UpdateItem reads it via
+    HasAppraise — an ABSENT field defaults Appraise=0 (locked), so every
+    encoder MUST send the persisted value explicitly.
 
     The item's COLOR comes from gameitem.quality, and per the client's
     EquipDrop flow that quality equals the rolled random stat's quality (or
@@ -1484,6 +1506,7 @@ def encode_gameitem(index_id: int, item_id: int, stack: int = 1,
         4: 0,
         5: stack,
         6: quality,
+        8: appraise,
     }
     if parm:
         # parm(7) is List<long> on the client (gameitem.decode uses

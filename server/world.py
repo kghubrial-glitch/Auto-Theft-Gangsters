@@ -342,6 +342,18 @@ def _char_stats(level: int, exp: int = 0):
     return _default_hp(level), exp
 
 
+def _gameitem_from_wire(entry):
+    """encode_gameitem kwargs from an _equipped_wire_items entry.
+
+    The tuple is (indexId, itemId, quality, level, random_attrs) or
+    (indexId, itemId, quality, level, random_attrs, appraise).
+    """
+    idx, iid, q, lvl, attrs_ = entry[:5]
+    appr = entry[5] if len(entry) > 5 else 1
+    return {"index_id": idx, "item_id": iid, "stack": 1, "quality": q,
+            "level": lvl, "random_attris": attrs_, "appraise": appr}
+
+
 def encode_character_blob(char_id: int, name: str, level: int,
                           pos_blob: bytes, profession: int = 0,
                           line_index: int = 0,
@@ -406,26 +418,25 @@ def encode_character_blob(char_id: int, name: str, level: int,
         # character.equip(9): map<indexId, gameitem> of EQUIPPACK items.
         # The client SyncPacks these into its EQUIPPACK container at spawn,
         # which is what puts the gear on the character's back.
-        equip_blobs = [P.encode_gameitem(idx, iid, stack=1, quality=q,
-                                         level=lvl, random_attris=attrs_)
-                       for idx, iid, q, lvl, attrs_ in equips]
+        equip_blobs = [P.encode_gameitem(**_gameitem_from_wire(e))
+                       for e in equips]
         fields[9] = P._enc.encode_object_array(equip_blobs)
     if badge_equips:
         # character.badge_equip(10): map<indexId, gameitem> of BADGE_EQUIPPACK.
         # The spawn handler resolves each entry with GetItemByIndex((int)
         # gameitem.parm[0]) — parm[0] MUST carry the badge's equip position
         # (0), and parm is an int-list of single-field objects.
-        badge_blobs = [P.encode_gameitem(idx, iid, stack=1, quality=q,
-                                         level=lvl, random_attris=attrs_,
-                                         parm=[0])
-                       for idx, iid, q, lvl, attrs_ in badge_equips]
+        badge_blobs = []
+        for e in badge_equips:
+            kw = _gameitem_from_wire(e)
+            kw["parm"] = [0]
+            badge_blobs.append(P.encode_gameitem(**kw))
         fields[10] = P._enc.encode_object_array(badge_blobs)
     if fashion_equips:
         # character.fashion_equip(11): map<indexId, gameitem> of
         # FASHION_EQUIPPACK pieces — the wardrobe's worn set at spawn
-        fashion_blobs = [P.encode_gameitem(idx, iid, stack=1, quality=q,
-                                           level=lvl, random_attris=attrs_)
-                         for idx, iid, q, lvl, attrs_ in fashion_equips]
+        fashion_blobs = [P.encode_gameitem(**_gameitem_from_wire(e))
+                         for e in fashion_equips]
         fields[11] = P._enc.encode_object_array(fashion_blobs)
     return P._enc.encode_object(fields)
 

@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS item_instances (
     quality     INTEGER NOT NULL DEFAULT 0,   -- EQUIP_QUALITY 0=WHITE..3=PURPLE
     level       INTEGER NOT NULL DEFAULT 0,   -- upgrade level
     attrs       TEXT NOT NULL DEFAULT '[]',   -- JSON [(attr_id,val,quality,skillId)]
+    appraise    INTEGER NOT NULL DEFAULT 1,   -- 0 = unidentified/locked, 1 = appraised
     created_at  INTEGER NOT NULL
 );
 
@@ -256,6 +257,16 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE skills ADD COLUMN index_pos INTEGER"
                 " NOT NULL DEFAULT 0")
+        # item_instances.appraise: 0 = unidentified (Appraise required),
+        # 1 = appraised/unlocked. Existing databases pre-date the appraise
+        # system; every rolled instance they hold was already usable, so
+        # they all migrate as appraised.
+        icols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(item_instances)")}
+        if "appraise" not in icols:
+            self._conn.execute(
+                "ALTER TABLE item_instances ADD COLUMN appraise INTEGER"
+                " NOT NULL DEFAULT 1")
         self._conn.commit()
         # one-time instance migration: legacy rows referenced bare item ids
         # with no index_id — roll a persisted instance for each so equipment
@@ -393,7 +404,17 @@ class Database:
         shows the new-item flag and the player can acknowledge it with
         change_item_state(240). Pass `seen=1` for starting grants (they must
         not appear as freshly-acquired). Already-seen stacks keep their flag.
+
+        Equipment stacks additionally get a persisted rolled instance at
+        acquisition time (the client's EquipDrop flow rolls the item when it
+        enters the bag, not at first equip):
+        * `seen=None` (a genuine new drop/reward) -> instance appraised=0 so
+          the Appraise page shows until the player identifies it.
+        * `seen=1` (starting grants, known items) -> instance appraised=1
+          (already usable).
+        Fashion/badge stacks never carry rolled attrs and skip this.
         """
+        from . import economy
         have = self.get_item_count(char_id, item_id)
         new = max(0, have + count)
         if new == 0:
@@ -409,6 +430,19 @@ class Database:
                 " ON CONFLICT(char_id, item_id) DO UPDATE SET count = ?",
                 (char_id, item_id, new, new_seen, new),
             )
+            idef = economy.ITEMS.get(item_id, {})
+            # roll the equipment's identity ONCE at acquisition: a genuinely
+            # new piece (seen=None) stays unidentified until appraised.
+            if idef.get("type") == "equipment" and \
+                    not self.find_instances(char_id, item_id):
+                appraised = 1 if new_seen else 0
+                if idef.get("slot") == 0 or "weapon_class" in idef:
+                    q, attrs = economy.roll_weapon_instance(item_id)
+                else:
+                    import random as _rnd
+                    q, attrs = economy.roll_armor_instance(item_id, _rnd)
+                self.create_instance(char_id, item_id, q, attrs,
+                                     appraised=appraised)
         else:
             self._conn.execute(
                 "INSERT INTO items (char_id, item_id, count)"
@@ -580,13 +614,21 @@ class Database:
 
     # -- item instances (rolled attrs/colors persist with the item) -------
     def create_instance(self, char_id: int, item_id: int, quality: int = 0,
-                        attrs: list = None, level: int = 0) -> int:
-        """Insert a rolled item instance; returns its stable index_id."""
+                        attrs: list = None, level: int = 0,
+                        appraised: int = 1) -> int:
+        """Insert a rolled item instance; returns its stable index_id.
+
+        `appraised` = 0 marks the instance UNIDENTIFIED: the client shows the
+        Appraise page until equip_appraise succeeds. Newly acquired drops /
+        rewards are rolled with appraised=0 so the genuinely-new-item flow
+        works; instances created through the equip path (starting gear,
+        legacy rolls) stay appraised=1.
+        """
         cur = self._conn.execute(
             "INSERT INTO item_instances (char_id, item_id, quality, level,"
-            " attrs, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            " attrs, appraise, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (char_id, item_id, quality, level,
-             json.dumps(attrs or []), int(time.time())),
+             json.dumps(attrs or []), int(appraised), int(time.time())),
         )
         self._conn.commit()
         return cur.lastrowid
@@ -629,6 +671,20 @@ class Database:
             (level, index_id))
         self._conn.commit()
 
+    def get_instance_appraised(self, index_id: int) -> int:
+        row = self._conn.execute(
+            "SELECT appraise FROM item_instances WHERE index_id = ?",
+            (index_id,),
+        ).fetchone()
+        return row["appraise"] if row else 1
+
+    def mark_instance_appraised(self, index_id: int) -> None:
+        """Record that the player paid to identify an item (unlocked)."""
+        self._conn.execute(
+            "UPDATE item_instances SET appraise = 1 WHERE index_id = ?",
+            (index_id,))
+        self._conn.commit()
+
     def delete_instance(self, index_id: int) -> None:
         self._conn.execute(
             "DELETE FROM item_instances WHERE index_id = ?", (index_id,))
@@ -659,24 +715,40 @@ class Database:
         self._conn.commit()
 
     def repair_stale_instances(self) -> None:
-        """Re-roll instances persisted by earlier bugged rolls:
+        """Re-roll only instances persisted by earlier bugged rolls:
 
-        * weapons that carried the base attack as a random_attri "skill"
-          entry (attr 1001 inside random_attri) or that rolled from the
-          wrong class pool (the pool lookup used `weapon_class`, which the
-          ITEMS merge names `class`) — weapons must carry ONLY one rolled
-          skill from their class's 6-skill pool, never the basic attack;
+        * weapons whose random_attri is missing the correct class skill set
+          (older builds stored the base attack as a "skill" entry, rolled a
+          single random skill, or picked from the wrong class pool) —
+          the correct weapon carries exactly the six skills of its own class
+          pool (basic attack excluded);
         * armor whose random_attri included the base status row (it showed
           up as a bogus "random status") — random_attri must hold only the
           1-2 random bonus stats.
+
+        Unchanged, correct weapons/armor are left untouched so their rolled
+        identity persists across server restarts (the skills/colors a player
+        saw on login are never silently re-rolled).
         """
         from . import economy
+        from . import game_data as _GD
         for row in self._conn.execute(
                 "SELECT index_id, char_id, item_id FROM item_instances") \
                 .fetchall():
             idef = economy.ITEMS.get(row["item_id"], {})
             is_weapon = idef.get("slot") == 0 or "weapon_class" in idef
             if is_weapon:
+                old = json.loads(self._conn.execute(
+                    "SELECT attrs FROM item_instances WHERE index_id = ?",
+                    (row["index_id"],)).fetchone()["attrs"])
+                # correct shape: exactly the class pool's six skills
+                pool = set(_GD.WEAPON_SKILL_POOL.get(
+                    idef.get("weapon_class", 0) or idef.get("class", 0),
+                    []))
+                rolled = {int(a[4]) for a in old
+                          if len(a) > 4 and a[4]}
+                if rolled == pool and len(old) == 6:
+                    continue            # already the right six skills
                 q, attrs = economy.roll_weapon_instance(row["item_id"])
             elif idef.get("type") == "equipment":
                 old = json.loads(self._conn.execute(
