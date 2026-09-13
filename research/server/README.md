@@ -80,8 +80,16 @@ Tags handled (see `server/protocol.py`):
   backpack sync via `sync_backpack_item` (592) and `update_item` (525).
 - **Equipment**: `equip_item` (116), `unequip_item` (117), `equip_badge` (197),
   `unequip_badge` (198), `equip_fashion_item` (221),
-  `unequip_fashion_item` (222), badge/fashion sync pushes (604 / 616),
-  equip-slot based weapon/armor/badge/fashion with combat stat effects.
+  `unequip_fashion_item` (222), `equip_appraise` (303), badge/fashion sync
+  pushes (604 / 616), equip-slot based weapon/armor/badge/fashion with
+  combat stat effects. `gameitem.appraise` (field 8) carries the item's
+  identified state: 0 = new/unidentified (Appraise page, blocked from
+  direct equipping), 1 = identified/usable. Newly acquired equipment rolls
+  an unidentified instance; `equip_appraise` (303) charges
+  `economy.APPRAISE_PRICE` gold and unlocks it. The EQUIPPACK map
+  (`character.equip` tag 9 and the post-equip resync) only ever carries the
+  six real armor/weapon slots — badge/fashion sync through their own
+  containers so no wrong ModelId hides a body part.
 - **Storage + packages**: `request_update_storagepack` (139) /
   `ret_request_update_storagepack` (550), `put_item_storagepack` (140),
   `take_item_storagepack` (141), `open_item_package` (224) /
@@ -94,7 +102,15 @@ Tags handled (see `server/protocol.py`):
   `drop_item_info` (527), and grant exp/gold (level-ups pushed via
   `sync_common_data` 614). NPCs lazily respawn at full HP.
 - **Skills**: `skill_use` (102) broadcast via `ret_skill_use` (508),
-  `skill_level_up` (130) with gold costs, `sync_skill_info` (540) push.
+  `skill_level_up` (130), `sync_skill_info` (540) push. A profession learns
+  its basic attack (the x01 combo opener, indexPos 3) PLUS its class's full
+  six-skill pool (indexPos 4..9, the two switch groups) — the basic attack
+  is a separate combat action and never occupies one of the six weapon skill
+  slots. A weapon instance carries all six class skills as random_attri
+  entries so the info panel and the skill bar match. Weapon skills persist
+  across relogin (rolled once at acquisition; `repair_stale_instances` only
+  repairs weapons that are missing the correct class set, never re-rolls
+  correct ones at restart).
 - **Player life**: `relife_player` (132) respawn flow with
   `aoi_relife_player` (512) / `notice_relife_player` (618); hp/max_hp per
   character with level-based growth.

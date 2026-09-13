@@ -69,6 +69,7 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             P.UNEQUIP_BADGE: self.h_unequip_badge,
             P.EQUIP_FASHION_ITEM: self.h_equip_fashion,
             P.UNEQUIP_FASHION_ITEM: self.h_unequip_fashion,
+            P.EQUIP_APPRAISE: self.h_equip_appraise,
             P.OPEN_ITEM_PACKAGE: self.h_open_item_package,
             P.REQUEST_UPDATE_STORAGEPACK: self.h_request_update_storagepack,
             P.PUT_ITEM_STORAGEPACK: self.h_put_item_storagepack,
@@ -373,15 +374,17 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         # immediately via the player-model page: equip/unequip + show/hide)
         for fashion_id in economy.ALL_FASHION_IDS:
             self.server.db.add_item(char_id, fashion_id, 1, seen=1)
-        # the class's real skill bar: x01 = basic attack (indexPos 3, the
-        # client's basic-attack slot), the remaining five skills from the
-        # 6-skill pool fill the two switch groups (indexPos 4..6 / 7..9 —
-        # ObjMainPlayer.UpdateSkillIdList maps them onto the action slots)
+        # the class's real skill bar: the basic attack x01 sits in the
+        # client's basic-attack slot (indexPos 3), and the class's FULL
+        # 6-skill pool fills the two switch groups (indexPos 4..6 = group A,
+        # 7..9 = group B — ObjMainPlayer.UpdateSkillIdList maps them onto
+        # the action slots). indexPos2 = indexPos so UpdateSkillList keeps
+        # the display sort order stable.
         from . import game_data as GD
         pool = GD.WEAPON_SKILL_POOL.get(
             prof_def.get("weapon_type", 0), [])
         skill_plan = [(prof_def["skills"][0], 3)]  # basic attack
-        for i, sid in enumerate(pool[:5]):
+        for i, sid in enumerate(pool[:6]):
             skill_plan.append((sid, 4 + i))
         for sid, index_pos in skill_plan:
             self.server.db.learn_skill(char_id, sid)
@@ -523,8 +526,14 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         # keep the skill/color they rolled once at creation, armor keeps its
         # rolled stat/color — never re-rolled at login.
         # (indexId, itemId, quality, level, random_attrs) - indexId must be
-        # non-zero (0 is the client's "unknown" sentinel).
-        equips = self._equipped_wire_items(wp.char_id)
+        # non-zero (0 is the client's "unknown" sentinel). ONLY the real
+        # armor/weapon slots 0..5 ride character.equip (EQUIPPACK): the
+        # client's main_player_create_handler SyncPacks tag 9 straight into
+        # its EQUIPPACK container, and a badge/fashion piece there would
+        # land on a real armor slot (GetItemByIndexId falls back to the
+        # first empty slot) and hide the body part with a wrong ModelId.
+        equips = self._equipped_wire_items(
+            wp.char_id, slots=tuple(range(0, 6)))
         # the WORN fashion set + badge ride their own character-blob maps
         # (badge_equip tag 10 / fashion_equip tag 11) so the wardrobe and
         # the model's fashion visuals are correct at spawn
@@ -608,7 +617,8 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         s.respond(msg, W.encode_main_player_create(
             wp, skills=[(r["skill_id"], r["level"], r["index_pos"])
                         for r in self.server.db.list_skills(row["id"])],
-            equips=self._equipped_wire_items(row["id"]),
+            equips=self._equipped_wire_items(
+                row["id"], slots=tuple(range(0, 6))),
             attrs=self.server.db.load_attributes(row["id"]) or None,
             hp=self.server.db.get_hp(row["id"])[1],
             cash=self.server.db.get_currency(row["id"],
@@ -1054,12 +1064,16 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             s.respond(msg, {0: 3})   # not enough currency
             return
         db.add_currency(char_id, good["currency"], -total)
-        new_count = db.add_item(char_id, good["item_id"], good["count"] * count)
+        # shop gear is bought identified (you see exactly what you pay for);
+        # loot/package/reward gear stays genuinely new -> appraise required
+        bought_type = economy.ITEMS.get(good["item_id"], {}).get("type")
+        new_count = db.add_item(
+            char_id, good["item_id"], good["count"] * count,
+            seen=1 if bought_type == "equipment" else None)
         s.respond(msg, {0: 0})
         # resync whichever bag container the bought item belongs to (the
         # client's bag tabs are split by ITEM_TYPE — equipment, consumables,
         # badges and fashions each have their own container)
-        bought_type = economy.ITEMS.get(good["item_id"], {}).get("type")
         if bought_type == "equipment":
             self._sync_backpack(s, char_id)
         elif bought_type == "badge":
@@ -1141,9 +1155,9 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         return db.get_instance(index_id)
 
     def _equipped_wire_items(self, char_id: int, slots=None) -> list:
-        """[(indexId, itemId, quality, level, random_attrs)] for every
-        equipped slot, from the PERSISTED instances (no re-roll). Slots
-        without a stored instance yet get one created exactly once.
+        """[(indexId, itemId, quality, level, random_attrs, appraise)] for
+        every equipped slot, from the PERSISTED instances (no re-roll).
+        Slots without a stored instance yet get one created exactly once.
         `slots` optionally restricts which db slots are returned (fashion
         9..12 / badge 8 have no rolled attrs and skip instance creation)."""
         equips = []
@@ -1161,14 +1175,14 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
                            and a[4] else "") for a in inst["attrs"]]
             equips.append((index_id if index_id is not None else inst["index_id"],
                            item_id, inst["quality"], inst["level"],
-                           wire_attrs))
+                           wire_attrs, inst.get("appraise", 1)))
         return equips
 
     @staticmethod
     def _push_item_update(s: Session, index_id: int, item_id: int,
                           container: int = None, quality: int = None,
                           level: int = 0, attrs: list = None,
-                          seen: int = 1) -> None:
+                          seen: int = 1, appraise: int = 1) -> None:
         """update_item(525): {containertype(0), indexId(1), gameitem(2)}.
 
         The client's update_item_handler updates the GameItem found by
@@ -1176,6 +1190,10 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         is ABSENT) — this is the real-time equip/unequip visual sync:
         EQUIPPACK (1) adds/removes gear from the character's back,
         EQUIP_BACKPACK (0) fills the bag slot.
+
+        `appraise` rides gameitem.appraise (field 8): a re-added item keeps
+        its persisted identified state so it never falls back to the Appraise
+        page after equipping/unequipping.
         """
         body = {0: container if container is not None
                 else P.CONTAINER_EQUIP_BACKPACK,   # EQUIP_BACKPACK = 0
@@ -1187,44 +1205,87 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
                 index_id, item_id, stack=1,
                 quality=quality if quality is not None else 2,
                 level=level, random_attris=attrs,
-                parm=[0, 0, 0, 0, 0, (0 if not seen else 1), 0, 0])
+                parm=[0, 0, 0, 0, 0, (0 if not seen else 1), 0, 0],
+                appraise=appraise)
         s.push(P.UPDATE_ITEM, body)
+
+    @staticmethod
+    def _slot_of_item(db, char_id: int, index_id: int, item_id: int):
+        """The db equip slot holding a (possibly just-unequipped) item.
+
+        `find_slot_by_index` is tried first (the piece was just removed);
+        for legacy instances without a slot the item's own slot_for() is
+        the fallback so the item re-adds to the correct bag container.
+        """
+        slot = db.find_slot_by_index(char_id, index_id)
+        if slot is not None:
+            return slot
+        return economy.slot_for(item_id)
 
     def _sync_equip_change(self, s: Session, char_id: int,
                            equipped_slot: int = None,
                            removed: tuple = None) -> None:
         """Push the client-side container updates after an equip/unequip.
 
-        `removed` is (indexId, itemId) of the piece that left the EQUIPPACK
-        (update_item without a gameitem resets the slot -> naked model);
-        `equipped_slot` re-syncs the whole EQUIPPACK map afterwards.
+        `removed` is (indexId, itemId, slot) of the piece that left the
+        EQUIPPACK (update_item without a gameitem resets the slot -> naked
+        model); `equipped_slot` re-syncs the whole EQUIPPACK map afterwards.
+
+        The item returns to the container matching its slot: real armor/
+        weapons (0..5) to EQUIP_BACKPACK, badges (8) to BADGE_BACKPACK,
+        fashion (9..12) to FASHION_BACKPACK.
         """
+        slot = None
         if removed is not None:
-            idx, iid = removed
-            # EQUIPPACK = 1: a gameitem-less update_item RESETS the slot —
-            # this is what takes the piece off the character's model.
-            self._push_item_update(s, idx, None,
-                                   container=P.CONTAINER_EQUIPPACK)
+            idx, iid = removed[0], removed[1]
+            slot = removed[2] if len(removed) > 2 else self._slot_of_item(
+                self.server.db, char_id, idx, iid)
+            if slot == economy.BADGE_DB_SLOT:
+                equip_cont, bag_cont = P.CONTAINER_BADGE_EQUIPPACK, \
+                    P.CONTAINER_BADGE_BACKPACK
+            elif slot is not None and slot >= economy.FASHION_DB_SLOT_BASE:
+                equip_cont, bag_cont = P.CONTAINER_FASHION_EQUIPPACK, \
+                    P.CONTAINER_FASHION_BACKPACK
+            else:
+                # EQUIPPACK = 1: a gameitem-less update_item RESETS the slot
+                # — this is what takes the piece off the character's model.
+                equip_cont, bag_cont = P.CONTAINER_EQUIPPACK, \
+                    P.CONTAINER_EQUIP_BACKPACK
+            self._push_item_update(s, idx, None, container=equip_cont)
             inst = self.server.db.get_instance(idx)
             if inst is not None:
                 self._push_item_update(
-                    s, idx, iid, container=P.CONTAINER_EQUIP_BACKPACK,
+                    s, idx, iid, container=bag_cont,
                     quality=inst["quality"], level=inst["level"],
                     attrs=[(a[0], a[1], a[2], a[3],
                             str(a[4]) if len(a) > 4 and a[4] else "")
-                           for a in inst["attrs"]])
+                           for a in inst["attrs"]],
+                    appraise=inst.get("appraise", 1))
             else:
                 self._push_item_update(s, idx, iid,
-                                       container=P.CONTAINER_EQUIP_BACKPACK,
-                                       quality=1)
+                                       container=bag_cont, quality=1,
+                                       appraise=1)
         self._sync_backpack(s, char_id)
+        if slot is not None and slot == economy.BADGE_DB_SLOT:
+            self._sync_badges(s, char_id)
+        if slot is not None and slot >= economy.FASHION_DB_SLOT_BASE:
+            self._sync_fashion(s, char_id)
         if equipped_slot is not None or removed is not None:
-            # re-send the full equip map so EQUIPPACK stays authoritative
-            for widx, wiid, q, lvl, wattrs in \
-                    self._equipped_wire_items(char_id):
+            # re-send ONLY the real armor/weapon EQUIPPACK (slots 0..5):
+            # badge/fashion live in their own containers and the client
+            # resolves an EQUIPPACK entry by indexId then falls back to the
+            # first empty slot, where GetEquipItemList matches on
+            # itemData.SubType — a leaked fashion/badge entry lands in a
+            # real armor slot, loads its (possibly empty) ModelId, and the
+            # body part disappears under the missing mesh.
+            for widx, wiid, q, lvl, wattrs, wappr in \
+                    self._equipped_wire_items(
+                        char_id,
+                        slots=tuple(range(0, 6))):
                 self._push_item_update(s, widx, wiid,
                                        container=P.CONTAINER_EQUIPPACK,
-                                       quality=q, level=lvl, attrs=wattrs)
+                                       quality=q, level=lvl, attrs=wattrs,
+                                       appraise=wappr)
 
     def _recalc_and_sync(self, s: Session, char_id: int) -> None:
         """Recalculate the attribute set + power from the equipped instances
@@ -1329,6 +1390,22 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             slot = idef.get("slot", 0)
         # roll + persist a REAL instance on first equip; re-equips reuse it
         inst = self._get_or_create_instance(char_id, slot, item_id, idef)
+        # equipping a genuinely-new (still unidentified) piece pays its
+        # identification fee server-side — the client's NewItemTips popup
+        # checks the appraise price against the wallet and then sends the
+        # equip request directly (no separate equip_appraise RPC), so a new
+        # item must never stay "locked" while it is on the character.
+        if not inst.get("appraise", 1):
+            gold = db.get_currency(char_id, economy.CURRENCY_GOLD)
+            if gold >= economy.APPRAISE_PRICE:
+                db.add_currency(char_id, economy.CURRENCY_GOLD,
+                                -economy.APPRAISE_PRICE)
+                db.mark_instance_appraised(inst["index_id"])
+                inst = db.get_instance(inst["index_id"])
+            else:
+                s.respond(msg, {0: 5})   # cannot afford identify on equip
+                db.set_equipped(char_id, slot, None)
+                return
         s.respond(msg, {0: 0})
         # real-time visual sync: put the piece on the character's back
         # (EQUIPPACK = 1) and REMOVE it from the bag grid (a gameitem-less
@@ -1339,7 +1416,8 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             quality=inst["quality"], level=inst["level"],
             attrs=[(a[0], a[1], a[2], a[3],
                     str(a[4]) if len(a) > 4 and a[4] else "")
-                   for a in inst["attrs"]])
+                   for a in inst["attrs"]],
+            appraise=inst.get("appraise", 1))
         self._push_item_update(s, inst["index_id"], None,
                                container=P.CONTAINER_EQUIP_BACKPACK)
         self._sync_equip_change(s, char_id)
@@ -1372,7 +1450,7 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         # re-add the item to the bag, then recalc stats/power
         self._sync_equip_change(s, char_id,
                                 removed=(index_id, removed_inst["item_id"]
-                                         if removed_inst else None))
+                                         if removed_inst else None, slot))
         self._recalc_and_sync(s, char_id)
 
     def _unequip_slot(self, s: Session, msg, slot: int) -> None:
@@ -1392,7 +1470,7 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         db.set_equipped(char_id, slot, None)
         s.respond(msg, {0: 0})
         self._sync_equip_change(s, char_id,
-                                removed=(index_id, item_id)
+                                removed=(index_id, item_id, slot)
                                 if index_id else None)
         self._recalc_and_sync(s, char_id)
 
@@ -1493,12 +1571,15 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
                                 <= economy.FASHION_DB_SLOT_BASE + 3):
             s.respond(msg, {0: 0})   # idempotent: clear the UI either way
             return
+        fashion_inst = db.get_instance(index_id)
+        fashion_iid = fashion_inst["item_id"] if fashion_inst else None
         db.set_equipped(char_id, slot, None)
         s.respond(msg, {0: 0})
         # reset the FASHION_EQUIPPACK slot (container 6; a gameitem-less
-        # update_item resets the slot -> the visual piece is removed)
-        self._push_item_update(s, index_id, None,
-                               container=P.CONTAINER_FASHION_EQUIPPACK)
+        # update_item resets the slot -> the visual piece is removed) and
+        # re-add the piece to the wardrobe
+        self._sync_equip_change(s, char_id,
+                                removed=(index_id, fashion_iid, slot))
         self._sync_fashion(s, char_id)
 
     async def h_open_item_package(self, s: Session, msg) -> None:
@@ -1589,6 +1670,55 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         import random
         name = "%s %s" % (random.choice(first), random.choice(last))
         s.respond(msg, {0: name})
+
+    async def h_equip_appraise(self, s: Session, msg) -> None:
+        """equip_appraise(303) — the client's Appraise/Identify action.
+
+        AppraiseRootLogic.OnClickAppraiseBtn sends {index(0)} = the item's
+        INSTANCE indexId. The server:
+          1. resolves the instance (must be equipment the character owns),
+          2. validates it is still unidentified,
+          3. charges the identification fee (gold),
+          4. marks the instance appraised=1,
+          5. re-syncs the bag so the client's GameItem updates IsAppraise.
+
+        A response intent of {0:0} (success) or nonzero errno is sent.
+        """
+        db = self.server.db
+        row = self._require_char(s)
+        if row is None:
+            s.respond(msg, {0: 1})
+            return
+        char_id = row["id"]
+        index_id = msg.body.get(0)
+        inst = db.get_instance(index_id) if isinstance(index_id, int) \
+            else None
+        if inst is None or inst["char_id"] != char_id:
+            s.respond(msg, {0: 2})  # unknown / not owned
+            return
+        idef = economy.ITEMS.get(inst["item_id"], {})
+        if idef.get("type") != "equipment":
+            s.respond(msg, {0: 3})  # not an appraisable piece
+            return
+        if inst.get("appraise", 1):
+            s.respond(msg, {0: 0})  # already identified -> idempotent
+            return
+        gold = db.get_currency(char_id, economy.CURRENCY_GOLD)
+        if gold < economy.APPRAISE_PRICE:
+            s.respond(msg, {0: 4})  # not enough gold
+            return
+        db.add_currency(char_id, economy.CURRENCY_GOLD,
+                        -economy.APPRAISE_PRICE)
+        db.mark_instance_appraised(index_id)
+        s.respond(msg, {0: 0})
+        # the item's appraised state rides every gameitem blob: resync the
+        # equipment bag so the client flips IsAppraise (backpack page shows
+        # the item as usable, no more Appraise button).
+        self._sync_backpack(s, char_id)
+        # mark the item "seen" as well — the appraise page is only shown for
+        # items the player actually opened; acknowledging resets the new flag
+        self.server.db.mark_item_seen(char_id, inst["item_id"])
+        self._recalc_and_sync(s, char_id)
 
     async def h_change_item_state(self, s: Session, msg) -> None:
         # The client acknowledges a newly-acquired item by sending

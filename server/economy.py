@@ -229,6 +229,12 @@ SKILLS.update(REAL_SKILLS)
 
 SKILL_LEVELUP_COST = 1000       # gold per skill level
 
+# Appraise (identification) pricing. The client computes the price itself
+# from EquipData.identify (the "price#quality" string recovered in the APK)
+# and only opens the send() when the player has enough gold; the server
+# re-validates with this flat per-quality rate as the authoritative cost.
+APPRAISE_PRICE = 1000           # gold per unidentified equipment instance
+
 # NPC kinds per map: kind -> (name, level, max_hp, damage, exp, loot table)
 # loot: {item_id: (drop chance 0..1, count)}
 #
@@ -421,12 +427,16 @@ def roll_weapon_instance(weapon_id: int, rng=None):
     """(quality_wire, attrs) for a weapon.
 
     The weapon's attack is its base BSValue atk (attr 1001), NEVER a skill.
-    The rolled skill comes ONLY from the class's 6-skill pool
-    (game_data.WEAPON_SKILL_POOL — the basic attack x01 is excluded) at a
-    rarity drawn from the recovered SkillQualityData weights; the weapon's
-    color IS the rolled skill's rarity. The attr entry carries (index,
-    attr_id, value, quality, skillId) — skillId is what the client shows as
-    the weapon's colored skill, quality is EQUIP_QUALITY 0..3.
+    The weapon carries the class's FULL 6-skill pool
+    (game_data.WEAPON_SKILL_POOL — the basic attack x01 is excluded) as one
+    random_attri entry per skill (index 0..5); skillId at field 4 is what
+    the client renders as each colored skill on the weapon info panel, and
+    the entry index maps onto the character's skill bar positions 4..9
+    (InfoLineItemLogic.ResetSkill -> GetPlayerSkillLevelByPos(index + 4)).
+    Each skill rolls its own rarity from the recovered SkillQualityData
+    weights; the weapon's color is the BEST rolled skill's rarity. The base
+    attack is the weapon's EquipData BSValue atk: it is applied server-side
+    from weapon_base_atk() and never sent as a random_attri entry.
     """
     import random as _random
     from . import game_data as GD
@@ -434,16 +444,14 @@ def roll_weapon_instance(weapon_id: int, rng=None):
     w = ITEMS.get(weapon_id, {})
     pool = GD.WEAPON_SKILL_POOL.get(w.get("weapon_class", 0)) \
         or [x for x in w.get("skills", []) if x % 100 != 1] or [102]
-    skill = rng.choice(pool)
-    q = _roll_skill_quality(rng)
-    wire_q = QUALITY_WIRE[q]
-    # ONLY the rolled skill rides random_attri (skillId at field 4) — the
-    # client's weapon info panel lists every random_attri entry carrying a
-    # skillId, so a base-atk entry here would render as a second "attack"
-    # skill. The base attack is the weapon's EquipData BSValue atk: it is
-    # applied server-side from weapon_base_atk() and never sent as a
-    # random_attri entry.
-    return wire_q, [(0, 0, 0, wire_q, str(skill))]
+    attrs = []
+    best_q = 0
+    for slot, sid in enumerate(pool[:6]):
+        q = _roll_skill_quality(rng)
+        best_q = max(best_q, q)
+        attrs.append((slot, 0, 0, QUALITY_WIRE[q], str(sid)))
+    wire_q = QUALITY_WIRE[best_q]
+    return wire_q, attrs
 
 
 def roll_armor_instance(armor_id: int, rng=None):
@@ -601,19 +609,21 @@ def weapon_skill_bonus(profession: int, instance: dict,
     idef = ITEMS.get(item_id, {})
     if idef.get("slot") != 0 and "weapon_class" not in idef:
         return 0
+    total = 0
     for a in instance.get("attrs", []):
         skill = a[4] if len(a) > 4 else None
-        if skill:
-            try:
-                sid = int(skill)
-            except (TypeError, ValueError):
-                continue
-            sdef = SKILLS.get(sid) or {}
-            fvalue = sdef.get("damage", 0)
-            q = a[3] if len(a) > 3 and a[3] in SKILL_QUALITY_MODULUS else 0
-            return int(fvalue * SKILL_QUALITY_MODULUS[q]
-                       * _attr_weight(profession, 1001))
-    return 0
+        if not skill:
+            continue
+        try:
+            sid = int(skill)
+        except (TypeError, ValueError):
+            continue
+        sdef = SKILLS.get(sid) or {}
+        fvalue = sdef.get("damage", 0)
+        q = a[3] if len(a) > 3 and a[3] in SKILL_QUALITY_MODULUS else 0
+        total += int(fvalue * SKILL_QUALITY_MODULUS[q]
+                     * _attr_weight(profession, 1001))
+    return total
 
 
 def character_attributes(db, char_id: int, level: int,

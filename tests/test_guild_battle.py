@@ -40,7 +40,13 @@ async def test_profession_grants_class_weapon_and_skills(server):
     equipped = srv.db.get_equipped(char_id, 0)
     assert equipped == 20001
     skills = [r["skill_id"] for r in srv.db.list_skills(char_id)]
-    assert skills == game_data.PROFESSIONS[1]["skills"]
+    # a profession learns its basic attack (the x01 combo opener) PLUS its
+    # class's full 6-skill pool — the basic attack is a separate combat
+    # action and must NOT be one of the six weapon skill slots.
+    assert sorted(skills) == sorted(
+        [game_data.PROFESSIONS[1]["skills"][0]]
+        + game_data.WEAPON_SKILL_POOL[1]), \
+        "basic attack + full 6-skill pool"
     await c.close()
 
 
