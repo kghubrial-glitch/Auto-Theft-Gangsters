@@ -439,6 +439,12 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         # EQUIPPACK containers — the bag (592 EQUIP_BACKPACK), items (611
         # ITEM_BACKPACK), badges (604) and fashion wardrobe (616) must be
         # filled here or they render empty after every login.
+        # fashion wardrobe top-up: accounts created before the grant existed
+        # (or that somehow lost pieces) get the full set here — idempotent
+        # (add_item caps at 1 per fashion id via count)
+        for fashion_id in economy.ALL_FASHION_IDS:
+            if self.server.db.get_item_count(row["id"], fashion_id) < 1:
+                self.server.db.add_item(row["id"], fashion_id, 1)
         self._sync_backpack(s, row["id"])
         self._sync_item_pack(s, row["id"])
         self._sync_badges(s, row["id"])
@@ -531,6 +537,11 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         # the visual blob's fashion part ids: the worn FASHION_EQUIPPACK set
         # renders on spawn (the client falls back to the base parts when a
         # piece is missing, so a partially worn set is fine)
+        # the worn weapon / fashion item ids ride the visual blob (fields
+        # 14/15): the client's PlayerData uses WeaponItemId to pick the
+        # weapon's render model and FashionItemId for the fashion weapon
+        weapon_item = self.server.db.get_equipped(wp.char_id, 0)
+        fashion_item = None
         wp.fashion_parts = (None, None, None, None)
         for slot, item_id, _idx in self.server.db.list_equipped(wp.char_id):
             if not (economy.FASHION_DB_SLOT_BASE <= slot
@@ -549,6 +560,10 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             elif fslot == 3:
                 wp.fashion_parts = (wp.fashion_parts[0], wp.fashion_parts[1],
                                     wp.fashion_parts[2], model or None)
+            if fslot == 2:
+                fashion_item = item_id
+        wp.weapon_item_id = str(weapon_item) if weapon_item else None
+        wp.fashion_item_id = str(fashion_item) if fashion_item else None
         s.push(P.MAIN_PLAYER_CREATE, W.encode_main_player_create(
             wp, skills=[(r["skill_id"], r["level"], r["index_pos"])
                         for r in self.server.db.list_skills(wp.char_id)],
@@ -780,7 +795,14 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         # updates entries found by indexId (or the first empty slot) — every
         # element must be a FULL gameitem blob or the bag renders empty.
         # Container: ITEM_CONTAINER_TYPE.EQUIP_BACKPACK = 0.
-        rows = self.server.db.list_items(char_id)
+        # EXCLUDE equipped items: the client's equipment tab reads the
+        # EQUIPPACK, but the bag grid shows every EQUIP_BACKPACK entry —
+        # a worn piece that also appears here renders as a duplicate
+        # ("items im wearing is the same as items in the bag").
+        equipped_ids = {item_id for _slot, item_id, _idx in
+                        self.server.db.list_equipped(char_id)}
+        rows = [r for r in self.server.db.list_items(char_id)
+                if r["item_id"] not in equipped_ids]
         instances = {i["item_id"]: i for i in
                      self.server.db.list_instances(char_id)}
         blobs = []
@@ -1242,13 +1264,17 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
         inst = self._get_or_create_instance(char_id, slot, item_id, idef)
         s.respond(msg, {0: 0})
         # real-time visual sync: put the piece on the character's back
-        # (EQUIPPACK = 1)
+        # (EQUIPPACK = 1) and REMOVE it from the bag grid (a gameitem-less
+        # EQUIP_BACKPACK update_item resets that bag slot — otherwise the
+        # item shows both worn and in the bag)
         self._push_item_update(
             s, inst["index_id"], item_id, container=P.CONTAINER_EQUIPPACK,
             quality=inst["quality"], level=inst["level"],
             attrs=[(a[0], a[1], a[2], a[3],
                     str(a[4]) if len(a) > 4 and a[4] else "")
                    for a in inst["attrs"]])
+        self._push_item_update(s, inst["index_id"], None,
+                               container=P.CONTAINER_EQUIP_BACKPACK)
         self._sync_equip_change(s, char_id)
         self._recalc_and_sync(s, char_id)
 
