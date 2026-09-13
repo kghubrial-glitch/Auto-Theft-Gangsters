@@ -1422,7 +1422,8 @@ def encode_aoi_update_attribute(char_id: int, hp: int, exp: int,
         0: char_id,
         1: attribute_other,
         2: attribute,
-        5: _enc.encode_object({13: gold, 14: diamond}),  # property money1/2
+        # property: 13=money1 CASH, 14=money2 GOLD, 15=money3 DIAMOND
+        5: _enc.encode_object({14: gold, 15: diamond}),
     })
     return _enc.encode_object({0: character})
 
@@ -1436,7 +1437,8 @@ def encode_gameitem(index_id: int, item_id: int, stack: int = 1,
                     quality: int = 2, level: int = 0,
                     bind: bool = True,
                     random_attris: list = None,
-                    parm: list = None) -> bytes:
+                    parm: list = None,
+                    appraise: int = None) -> bytes:
     """SprotoType.gameitem, the REAL inventory element (decode() switch):
     indexId(0) i, itemId(1) STRING, bindflag(2) b, level(3) i, flags(4) i,
     stack(5) i, quality(6) i, parm(7) int-list, appraise(8) i,
@@ -1463,6 +1465,15 @@ def encode_gameitem(index_id: int, item_id: int, stack: int = 1,
         5: stack,
         6: quality,
     }
+    if appraise is None:
+        # default: 1 for equipment (appraised/unlocked -- GameItem.IsAppraise
+        # gates equip/use; absent/0 renders the piece as "needs appraise",
+        # which the bag shows as LOCKED), 0 for everything else
+        from . import economy as _economy
+        appraise = 1 if _economy.ITEMS.get(item_id, {}).get(
+            "type") == "equipment" else 0
+    if appraise:
+        fields[8] = appraise
     if parm:
         # parm(7) is List<long> on the client (gameitem.decode uses
         # read_integer_list) -- encode as a packed integer array, NOT an

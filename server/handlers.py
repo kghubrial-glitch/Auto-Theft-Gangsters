@@ -571,7 +571,11 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
             attrs=self.server.db.load_attributes(wp.char_id) or None,
             hp=self.server.db.get_hp(wp.char_id)[1],
             badge_equips=badge_equips, fashion_equips=fashion_equips,
-            show_type=show_type))
+            show_type=show_type,
+            gold=self.server.db.get_currency(wp.char_id,
+                                             economy.CURRENCY_GOLD),
+            diamond=self.server.db.get_currency(wp.char_id,
+                                                economy.CURRENCY_DIAMOND)))
 
     async def h_enter_map(self, s: Session, msg) -> None:
         # Legacy request form (tests / reconnect helpers). The real client
@@ -601,7 +605,11 @@ class Handlers(PvpHandlersMixin, WildHandlersMixin,
                         for r in self.server.db.list_skills(row["id"])],
             equips=self._equipped_wire_items(row["id"]),
             attrs=self.server.db.load_attributes(row["id"]) or None,
-            hp=self.server.db.get_hp(row["id"])[1]))
+            hp=self.server.db.get_hp(row["id"])[1],
+            gold=self.server.db.get_currency(row["id"],
+                                             economy.CURRENCY_GOLD),
+            diamond=self.server.db.get_currency(row["id"],
+                                                economy.CURRENCY_DIAMOND)))
         for other in self.server.world.others(map_id, row["id"]):
             s.push(P.AOI_ADD, {0: W.encode_aoi_add(other)})
         for npc in self.server.world.npcs_in(map_id):

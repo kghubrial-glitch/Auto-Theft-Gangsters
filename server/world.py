@@ -321,9 +321,13 @@ def _attribute_other_blob(hp: int, exp: int, level: int,
     })
 
 
-def _property_blob(gold: int = 0, diamond: int = 0) -> bytes:
-    return P._enc.encode_object({13: gold, 14: diamond, 15: 0, 16: 0,
-                                 17: 0, 18: 0})
+def _property_blob(cash: int = 0, gold: int = 0, diamond: int = 0) -> bytes:
+    # property decode tags (SprotoType.property): 13=money1 CASH,
+    # 14=money2 GOLD, 15=money3 DIAMOND (GameMoneyHelper.UpdateMoney maps
+    # money1->Cash, money2->Gold, money3->Diamond). Writing gold at 13
+    # made the client show the gold balance as Cash and Diamond as 0.
+    return P._enc.encode_object({13: cash, 14: gold, 15: diamond,
+                                 16: 0, 17: 0, 18: 0})
 
 
 def _attribute_overview_blob(level: int, comb_value: int = 0) -> bytes:
@@ -380,7 +384,7 @@ def encode_character_blob(char_id: int, name: str, level: int,
         0: char_id,
         1: _general_blob(name, profession, line_index, map_id),
         2: _attribute_other_blob(hp, exp, level, comb_value),
-        5: _property_blob(gold, diamond),
+        5: _property_blob(0, gold, diamond),
         6: _visual_blob(profession, name, show_type,
                         fashion_parts=fashion_parts,
                         weapon_item_id=weapon_item_id,
@@ -526,7 +530,9 @@ def encode_main_player_create(player: WorldPlayer,
                               hp: int = None,
                               badge_equips: list = None,
                               fashion_equips: list = None,
-                              show_type: int = 0) -> dict:
+                              show_type: int = 0,
+                              gold: int = 0,
+                              diamond: int = 0) -> dict:
     """Field dict for the main_player_create PUSH body:
     {character(0), movement(1)}.
 
@@ -553,7 +559,8 @@ def encode_main_player_create(player: WorldPlayer,
         fashion_equips=fashion_equips, show_type=show_type,
         fashion_parts=getattr(player, "fashion_parts", None),
         weapon_item_id=getattr(player, "weapon_item_id", None),
-        fashion_item_id=getattr(player, "fashion_item_id", None))
+        fashion_item_id=getattr(player, "fashion_item_id", None),
+        gold=gold, diamond=diamond)
     return {
         0: character,
         1: player.movement_blob(),
