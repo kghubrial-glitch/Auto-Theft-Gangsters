@@ -163,8 +163,10 @@ async def test_equip_and_unequip_flow(server):
     attrs_after = db.load_attributes(char_id)
     assert attrs_after.get("power", 0) < weapon_power
 
-    # equipping an item you do not own fails
-    resp = await c.rpc(P.EQUIP_ITEM, {0: 11})
+    # equipping an item you do not own fails (a real class weapon that
+    # was never added -> instance/stack lookup finds nothing -> count 0)
+    prof = db.get_character(char_id)["profession"]
+    resp = await c.rpc(P.EQUIP_ITEM, {0: ((prof + 1) % 3) * 10000 + 101})
     assert resp.body[0] == 3
 
     await c.close()

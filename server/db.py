@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS skills (
     char_id     INTEGER NOT NULL REFERENCES characters(id),
     skill_id    INTEGER NOT NULL,
     level       INTEGER NOT NULL DEFAULT 1,
+    index_pos   INTEGER NOT NULL DEFAULT 0,
     UNIQUE(char_id, skill_id)
 );
 
@@ -236,6 +237,13 @@ class Database:
                 "UPDATE equip_slots SET slot = 8 WHERE slot = 2")
             self._conn.execute(
                 "UPDATE equip_slots SET slot = 9 WHERE slot = 3")
+        # skills table: index_pos added in this revision
+        scols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(skills)")}
+        if "index_pos" not in scols:
+            self._conn.execute(
+                "ALTER TABLE skills ADD COLUMN index_pos INTEGER"
+                " NOT NULL DEFAULT 0")
         self._conn.commit()
         # one-time instance migration: legacy rows referenced bare item ids
         # with no index_id — roll a persisted instance for each so equipment
@@ -599,6 +607,46 @@ class Database:
                 (iid, row["rid"]))
         self._conn.commit()
 
+    def repair_stale_instances(self) -> None:
+        """Re-roll instances persisted by earlier bugged rolls:
+
+        * weapons that carried the base attack as a random_attri "skill"
+          entry (attr 1001 inside random_attri) or that rolled from the
+          wrong class pool (the pool lookup used `weapon_class`, which the
+          ITEMS merge names `class`) — weapons must carry ONLY one rolled
+          skill from their class's 6-skill pool, never the basic attack;
+        * armor whose random_attri included the base status row (it showed
+          up as a bogus "random status") — random_attri must hold only the
+          1-2 random bonus stats.
+        """
+        from . import economy
+        for row in self._conn.execute(
+                "SELECT index_id, char_id, item_id FROM item_instances") \
+                .fetchall():
+            idef = economy.ITEMS.get(row["item_id"], {})
+            is_weapon = idef.get("slot") == 0 or "weapon_class" in idef
+            if is_weapon:
+                q, attrs = economy.roll_weapon_instance(row["item_id"])
+            elif idef.get("type") == "equipment":
+                old = json.loads(self._conn.execute(
+                    "SELECT attrs FROM item_instances WHERE index_id = ?",
+                    (row["index_id"],)).fetchone()["attrs"])
+                has_base = any(a[1] == 0 for a in old if len(a) > 1)
+                base_ids = {a for a, _ in economy.armor_base_attrs(
+                    row["item_id"])}
+                has_base_status = any(a[1] in base_ids for a in old
+                                      if len(a) > 1)
+                if not has_base and not has_base_status:
+                    continue            # already clean
+                q, attrs = economy.roll_armor_instance(row["item_id"])
+            else:
+                continue                # fashion/badge: no rolled attrs
+            self._conn.execute(
+                "UPDATE item_instances SET quality = ?, attrs = ?"
+                " WHERE index_id = ?",
+                (q, json.dumps(attrs), row["index_id"]))
+        self._conn.commit()
+
     def get_flag_row(self, key: str):
         return self._conn.execute(
             "SELECT value FROM progress WHERE char_id = 0 AND key = ?",
@@ -891,7 +939,7 @@ class Database:
     # -- skills ---------------------------------------------------------------
     def list_skills(self, char_id: int):
         return self._conn.execute(
-            "SELECT skill_id, level FROM skills WHERE char_id = ?"
+            "SELECT skill_id, level, index_pos FROM skills WHERE char_id = ?"
             " ORDER BY skill_id", (char_id,),
         ).fetchall()
 
@@ -901,16 +949,29 @@ class Database:
             (char_id, skill_id),
         ).fetchone()
 
-    def learn_skill(self, char_id: int, skill_id: int) -> int:
+    def learn_skill(self, char_id: int, skill_id: int,
+                    index_pos: int = None) -> int:
         row = self.get_skill(char_id, skill_id)
         level = (row["level"] if row else 0) + 1
         self._conn.execute(
-            "INSERT INTO skills (char_id, skill_id, level) VALUES (?, ?, ?)"
+            "INSERT INTO skills (char_id, skill_id, level, index_pos)"
+            " VALUES (?, ?, ?, ?)"
             " ON CONFLICT(char_id, skill_id) DO UPDATE SET level = ?",
-            (char_id, skill_id, level, level),
+            (char_id, skill_id, level,
+             index_pos if index_pos is not None else
+             (row["index_pos"] if row else 0), level),
         )
         self._conn.commit()
         return level
+
+    def set_skill_index_pos(self, char_id: int, skill_id: int,
+                            index_pos: int) -> None:
+        self._conn.execute(
+            "UPDATE skills SET index_pos = ?"
+            " WHERE char_id = ? AND skill_id = ?",
+            (index_pos, char_id, skill_id),
+        )
+        self._conn.commit()
 
     # -- pvp ladder -------------------------------------------------------------
     def append_pvp_history(self, char_id: int, blob: bytes) -> None:

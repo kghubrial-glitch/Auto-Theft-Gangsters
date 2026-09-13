@@ -18,7 +18,8 @@ from . import protocol as P
 class WorldPlayer:
     __slots__ = ("conn", "char_id", "name", "level", "sex", "profession",
                  "map_id", "line_index", "pos", "moving", "walk", "dead",
-                 "comb_value")
+                 "comb_value", "fashion_parts", "weapon_item_id",
+                 "fashion_item_id")
 
     def __init__(self, conn, char_id: int, name: str, level: int = 1,
                  sex: int = 0, profession: int = 0) -> None:
@@ -35,6 +36,10 @@ class WorldPlayer:
         self.walk = True
         self.dead = False
         self.comb_value = 100 * level
+        # fashion look carried into the spawn blob's characterVisual
+        self.fashion_parts = (None, None, None, None)
+        self.weapon_item_id = None
+        self.fashion_item_id = None
 
     def movement_blob(self) -> bytes:
         return P._enc.encode_object({
@@ -233,20 +238,42 @@ def _general_blob(name: str, profession: int, line_index: int = 0,
     return P._enc.encode_object(fields)
 
 
-def _visual_blob(profession: int, name: str) -> bytes:
+def _visual_blob(profession: int, name: str, show_type: int = 0,
+                 fashion_parts: tuple = None,
+                 weapon_item_id: str = None,
+                 fashion_item_id: str = None) -> bytes:
+    """SprotoType.characterVisual — UpdateMainPlayerVisual/ResetMainPlayer
+    read the fashion part ids (6-9: Fashion_Head/Body/Leg/Weapon), the
+    WeaponItemId/FashionItemId (14/15) and showType (10). Fashion part ids
+    default to the normal part when absent (client rule: HasFashion_X ?
+    Fashion_X : X), so the model renders the worn fashion set on spawn
+    instead of always the default skin."""
     model_id, base = PROFESSION_MODELS.get(profession, PROFESSION_MODELS[0])
-    return P._enc.encode_object({
+    fp = fashion_parts or (None, None, None, None)
+    fields = {
         0: name,
         1: model_id,          # ModeId -> CharacterModelData row
         2: base + "_T",       # HeadId
         3: base + "_S",       # BodyId
         4: base + "_X",       # LegId
         5: base + "_WQ",      # WeaponId
-        10: 0,                # showType: 0 = normal parts, not fashion
+        10: show_type,        # showType: 1 = wearing fashion, 0 = normal
         12: "",               # MountId
         13: 0,                # mount_state
         14: "",               # mount_color
-    })
+    }
+    # only send the fashion fields when the fashion look is actually shown —
+    # otherwise leave them absent (the client falls back to the base parts)
+    if show_type == 1:
+        head, body, weapon, leg = fp
+        for tag, val in ((6, head), (7, body), (8, leg), (9, weapon)):
+            if val:
+                fields[tag] = val
+        if weapon_item_id:
+            fields[14] = str(weapon_item_id)
+        if fashion_item_id:
+            fields[15] = str(fashion_item_id)
+    return P._enc.encode_object(fields)
 
 
 def _attribute_blob(hp: int, exp: int, atk: int = 10, attrs: dict = None) -> bytes:
@@ -320,7 +347,13 @@ def encode_character_blob(char_id: int, name: str, level: int,
                           hp: int = None, skills: list = None,
                           comb_value: int = 0,
                           equips: list = None,
-                          attrs: dict = None) -> bytes:
+                          attrs: dict = None,
+                          badge_equips: list = None,
+                          fashion_equips: list = None,
+                          show_type: int = 0,
+                          fashion_parts: tuple = None,
+                          weapon_item_id: str = None,
+                          fashion_item_id: str = None) -> bytes:
     """Full SprotoType.character blob for main_player_create.
 
     The client's ObjInitPlayerData.InitData(character) hard-dereferences
@@ -348,13 +381,20 @@ def encode_character_blob(char_id: int, name: str, level: int,
         1: _general_blob(name, profession, line_index, map_id),
         2: _attribute_other_blob(hp, exp, level, comb_value),
         5: _property_blob(gold, diamond),
-        6: _visual_blob(profession, name),
+        6: _visual_blob(profession, name, show_type,
+                        fashion_parts=fashion_parts,
+                        weapon_item_id=weapon_item_id,
+                        fashion_item_id=fashion_item_id),
         7: pos_blob,
         13: _runtime_blob(hp, exp, attrs),
         15: 2,                # download = 2 -> IsFinishDownload = true
     }
     if skills:
-        skill_blobs = [P.encode_skill_info(sid, lvl) for sid, lvl in skills]
+        skill_blobs = [
+            P.encode_skill_info(sid, lvl, index_pos=(s[2] if len(s) > 2
+                                                     else 0))
+            for s in skills for sid, lvl in [s[:2]]
+        ]
         fields[8] = P._enc.encode_object_array(skill_blobs)
         fields[16] = 0        # skill_index: hard-dereferenced by InitData
     if equips:
@@ -365,6 +405,23 @@ def encode_character_blob(char_id: int, name: str, level: int,
                                          level=lvl, random_attris=attrs_)
                        for idx, iid, q, lvl, attrs_ in equips]
         fields[9] = P._enc.encode_object_array(equip_blobs)
+    if badge_equips:
+        # character.badge_equip(10): map<indexId, gameitem> of BADGE_EQUIPPACK.
+        # The spawn handler resolves each entry with GetItemByIndex((int)
+        # gameitem.parm[0]) — parm[0] MUST carry the badge's equip position
+        # (0), and parm is an int-list of single-field objects.
+        badge_blobs = [P.encode_gameitem(idx, iid, stack=1, quality=q,
+                                         level=lvl, random_attris=attrs_,
+                                         parm=[0])
+                       for idx, iid, q, lvl, attrs_ in badge_equips]
+        fields[10] = P._enc.encode_object_array(badge_blobs)
+    if fashion_equips:
+        # character.fashion_equip(11): map<indexId, gameitem> of
+        # FASHION_EQUIPPACK pieces — the wardrobe's worn set at spawn
+        fashion_blobs = [P.encode_gameitem(idx, iid, stack=1, quality=q,
+                                           level=lvl, random_attris=attrs_)
+                         for idx, iid, q, lvl, attrs_ in fashion_equips]
+        fields[11] = P._enc.encode_object_array(fashion_blobs)
     return P._enc.encode_object(fields)
 
 
@@ -466,7 +523,10 @@ def encode_main_player_create(player: WorldPlayer,
                               skills: list = None,
                               equips: list = None,
                               attrs: dict = None,
-                              hp: int = None) -> dict:
+                              hp: int = None,
+                              badge_equips: list = None,
+                              fashion_equips: list = None,
+                              show_type: int = 0) -> dict:
     """Field dict for the main_player_create PUSH body:
     {character(0), movement(1)}.
 
@@ -489,7 +549,11 @@ def encode_main_player_create(player: WorldPlayer,
         profession=player.profession, line_index=player.line_index,
         map_id=player.map_id, skills=skills, equips=equips,
         comb_value=getattr(player, "comb_value", 0),
-        attrs=attrs, hp=hp)
+        attrs=attrs, hp=hp, badge_equips=badge_equips,
+        fashion_equips=fashion_equips, show_type=show_type,
+        fashion_parts=getattr(player, "fashion_parts", None),
+        weapon_item_id=getattr(player, "weapon_item_id", None),
+        fashion_item_id=getattr(player, "fashion_item_id", None))
     return {
         0: character,
         1: player.movement_blob(),

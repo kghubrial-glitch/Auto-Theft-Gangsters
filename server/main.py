@@ -20,6 +20,9 @@ log = logging.getLogger("atg.main")
 class GameServer:
     def __init__(self, advertise_ip: str = None) -> None:
         self.db = Database(config.DB_PATH)
+        # fix instances rolled by earlier bugged weapon/armor logic (main
+        # attack stored as a "skill", base status stored as a random stat)
+        self.db.repair_stale_instances()
         self.world = World()
         self.handlers = Handlers(self)
         env_ip = config.ADVERTISE_IP or advertise_ip

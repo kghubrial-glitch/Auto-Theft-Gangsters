@@ -9,6 +9,9 @@ and arrays) are pre-encoded with the helpers in `sproto.py` and passed as
 
 from . import sproto as _enc
 
+# late-bound content tables (economy) for encode_backpack_gameitem; imported
+# lazily inside the function to avoid a circular import at module load.
+
 # --- protocol tags (from Protocol.*.cs) ------------------------------------
 VISITOR = 2
 VERFIY = 3
@@ -66,6 +69,17 @@ RET_ABANDON_MISSION = 522
 SET_MISSION_STATE = 523
 SET_MISSION_PARAM = 524
 UPDATE_ITEM = 525
+
+# ITEM_CONTAINER_TYPE values carried by update_item (analysis/
+# ITEM_CONTAINER_TYPE.cs). Getting these wrong sends the visual update to a
+# container the client doesn't render (7 = INVALID):
+CONTAINER_EQUIP_BACKPACK = 0
+CONTAINER_EQUIPPACK = 1
+CONTAINER_ITEM_BACKPACK = 2
+CONTAINER_BADGE_BACKPACK = 3
+CONTAINER_BADGE_EQUIPPACK = 4
+CONTAINER_FASHION_BACKPACK = 5
+CONTAINER_FASHION_EQUIPPACK = 6
 RET_USE_ITEM = 526
 SYNC_BACKPACK_ITEM = 592
 SHOW_REWARD_ITEMS_TIPS = 638
@@ -808,7 +822,10 @@ RESPONSE_SPECS = {
     # set_mission_param {missionId(0) STRING, paramindex(1) int, param(2) int}
     SET_MISSION_PARAM: {0: "s", 1: "i", 2: "i"},
     RET_USE_ITEM: {0: "i", 1: "i"},
-    UPDATE_ITEM: {0: "i", 1: "i", 2: "i"},
+    # update_item: {containertype(0) i, indexId(1) i, gameitem(2) object}
+    # (SprotoType.update_item) — gameitem is a single object blob, or an
+    # empty object when the slot is cleared
+    UPDATE_ITEM: {0: "i", 1: "i", 2: "o"},
     SYNC_BACKPACK_ITEM: {0: "oa"},
     RET_ASK_SHOP_LIST: {0: "i", 1: "oa"},
     RET_BUY_SHOP_ITEM: {0: "i", 1: "i"},
@@ -1126,9 +1143,48 @@ def encode_set_mission_param(mission_id: str, index: int, param: int) -> dict:
     return {0: str(mission_id), 1: int(index), 2: int(param)}
 
 
-def encode_item_stack(item_id: int, count: int) -> bytes:
-    """Backpack element: {item_id(0), count(1)}."""
+def encode_item_stack(item_id: int, count: int, index_id: int = None) -> bytes:
+    """Stackable item blob {item_id(0), count(1)} (storage/missions/rewards).
+
+    NOTE: the ITEM containers (sync_backpack_item 592 / sync_item_pack 611 /
+    sync_badgepack / sync_fashion_backpack) do NOT take this shape — they
+    decode map<indexId, gameitem> full gameitem blobs. Use
+    encode_backpack_gameitem for those pushes.
+    """
     return _enc.encode_object({0: item_id, 1: count})
+
+
+def encode_backpack_gameitem(char_id_row, instance=None) -> bytes:
+    """Backpack/fashion/badge container element: a FULL gameitem blob.
+
+    sync_backpack_item et al. decode map<indexId, gameitem> and only update
+    entries the client can find by indexId (or the first empty slot), so
+    every element must be a complete SprotoType.gameitem — an {itemId,
+    count} stack decodes as garbage (itemId as indexId 0, stack missing)
+    and the bag renders empty/broken.
+
+    `char_id_row` is a db item row {item_id, count}; `instance` optionally
+    carries a persisted rolled instance (quality/attrs/level/index_id).
+    """
+    from . import economy
+    item_id = char_id_row["item_id"]
+    # db rows are sqlite3.Row (no .get); instances are plain dicts
+    try:
+        count = char_id_row["count"]
+    except (KeyError, IndexError):
+        count = 1
+    idef = economy.ITEMS.get(item_id, {})
+    if instance is not None:
+        attrs = [(a[0], a[1], a[2], a[3], str(a[4]) if len(a) > 4 and a[4]
+                  else "") for a in instance.get("attrs", [])]
+        return encode_gameitem(instance["index_id"], item_id, stack=1,
+                               quality=instance["quality"],
+                               level=instance["level"], random_attris=attrs)
+    if idef.get("type") == "equipment" and item_id in economy.ARMOR_ITEMS:
+        # armor without a rolled instance yet: plain quality, no attrs
+        return encode_gameitem(item_id, item_id, stack=1, quality=1)
+    quality = 2 if idef.get("type") == "equipment" else 0
+    return encode_gameitem(item_id, item_id, stack=count, quality=quality)
 
 
 def encode_acceptdamge(obj_id: int, damage: int, skill_id: str = "1",
@@ -1379,7 +1435,8 @@ def encode_npc_create(npc) -> bytes:
 def encode_gameitem(index_id: int, item_id: int, stack: int = 1,
                     quality: int = 2, level: int = 0,
                     bind: bool = True,
-                    random_attris: list = None) -> bytes:
+                    random_attris: list = None,
+                    parm: list = None) -> bytes:
     """SprotoType.gameitem, the REAL inventory element (decode() switch):
     indexId(0) i, itemId(1) STRING, bindflag(2) b, level(3) i, flags(4) i,
     stack(5) i, quality(6) i, parm(7) int-list, appraise(8) i,
@@ -1406,6 +1463,9 @@ def encode_gameitem(index_id: int, item_id: int, stack: int = 1,
         5: stack,
         6: quality,
     }
+    if parm:
+        fields[7] = _enc.encode_object_array(
+            [_enc.encode_object({0: v}) for v in parm])
     if random_attris:
         stat_quality = None
         attr_blobs = []
@@ -1425,15 +1485,21 @@ def encode_gameitem(index_id: int, item_id: int, stack: int = 1,
     return _enc.encode_object(fields)
 
 
-def encode_skill_info(skill_id: int, level: int) -> bytes:
+def encode_skill_info(skill_id: int, level: int, index_pos: int = 0,
+                      index_pos2: int = 0) -> bytes:
     """sync_skill_info / character.skills element (SprotoType.skill_info).
 
     The client decodes skillId as a STRING (read_string) and uses it as the
     dictionary key; it must be a string like "101", not an integer — an int
     here makes read_string hit the end of the stream and the push dies with
     "Exception: invalid pos" on the client.
+
+    indexPos (field 2) drives the skill bar (ObjMainPlayer.UpdateSkillIdList):
+    index 3 = the basic-attack slot, 4..6 = switch-group A, 7..9 = group B.
+    indexPos2 (field 4) is the display sort order.
     """
-    return _enc.encode_object({0: str(skill_id), 1: level})
+    return _enc.encode_object({0: str(skill_id), 1: level,
+                               2: index_pos, 4: index_pos2})
 
 
 def encode_friend_entry(char_id: int, name: str, level: int = 1,

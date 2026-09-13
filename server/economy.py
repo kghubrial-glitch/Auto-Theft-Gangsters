@@ -67,6 +67,33 @@ for _wid, _w in REAL_WEAPONS.items():
         "tier": _w["tier"], "skills": _w["skills"],
     }
 
+# --- fashion (ITEM_TYPE.FASHION_EQUIP = 16) ----------------------------------
+# fashion_id -> {"name", "type": "fashion", "fashion_slot" (client
+# FASHION_EQUIPPACK index: 0 head / 1 body / 2 weapon / 3 leg), "model",
+# "price"}. Model ids are CharacterModelData part rows (base suffix _T/_S/
+# _WQ/_X like the armor visuals) so the client can render the worn piece.
+FASHION_SET = {
+    70: {"name": "Street Cap",        "type": "fashion", "fashion_slot": 0,
+         "model": "", "price": 1000},
+    71: {"name": "Leather Jacket",    "type": "fashion", "fashion_slot": 1,
+         "model": "", "price": 2000},
+    72: {"name": "Gold Bat Skin",     "type": "fashion", "fashion_slot": 2,
+         "model": "", "price": 3000},
+    73: {"name": "Cargo Pants",       "type": "fashion", "fashion_slot": 3,
+         "model": "", "price": 1500},
+    74: {"name": "Red Beanie",        "type": "fashion", "fashion_slot": 0,
+         "model": "", "price": 1200},
+    75: {"name": "Street Suit",       "type": "fashion", "fashion_slot": 1,
+         "model": "", "price": 6000},
+    76: {"name": "Chrome Bat Skin",   "type": "fashion", "fashion_slot": 2,
+         "model": "", "price": 5000},
+    77: {"name": "Track Pants",       "type": "fashion", "fashion_slot": 3,
+         "model": "", "price": 1800},
+}
+ITEMS.update(FASHION_SET)
+# every new account spawns with ALL fashions in the wardrobe
+ALL_FASHION_IDS = sorted(FASHION_SET)
+
 # --- cars --------------------------------------------------------------------
 # legacy placeholder cars (shop goods 901-903 reference ids 1-3)
 LEGACY_CARS = {
@@ -286,6 +313,21 @@ BADGE_DB_SLOT = 8
 FASHION_DB_SLOT = 9
 
 
+# fashion db slots: FASHION_DB_SLOT + client FASHION_EQUIPPACK index
+# (0 head / 1 body / 2 weapon / 3 leg) -> 9..12
+FASHION_DB_SLOT_BASE = 9
+
+
+def fashion_slot_for(item_id: int):
+    """db equip slot for a fashion piece (9..12), or None."""
+    idef = ITEMS.get(item_id)
+    if idef is None or idef.get("type") != "fashion":
+        return None
+    if "fashion_slot" in idef:
+        return FASHION_DB_SLOT_BASE + idef["fashion_slot"]
+    return FASHION_DB_SLOT
+
+
 def slot_for(item_id: int):
     """db equip slot for an item id, or None if it is not equipment."""
     idef = ITEMS.get(item_id)
@@ -294,7 +336,7 @@ def slot_for(item_id: int):
     if idef.get("type") == "badge":
         return BADGE_DB_SLOT
     if idef.get("type") == "fashion":
-        return FASHION_DB_SLOT
+        return fashion_slot_for(item_id)
     if idef.get("type") != "equipment":
         return None
     if idef.get("slot") == 0 or "weapon_class" in idef:
@@ -389,60 +431,65 @@ def roll_weapon_instance(weapon_id: int, rng=None):
     rng = rng or _random
     w = ITEMS.get(weapon_id, {})
     pool = GD.WEAPON_SKILL_POOL.get(w.get("weapon_class", 0)) \
-        or w.get("skills") or [102]
+        or [x for x in w.get("skills", []) if x % 100 != 1] or [102]
     skill = rng.choice(pool)
     q = _roll_skill_quality(rng)
     wire_q = QUALITY_WIRE[q]
-    # base atk rides the normal attribute slot (attr 1001); the random slot
-    # is reserved for the rolled skill
-    atk = w.get("atk", 0) or w.get("power", 0)
-    return wire_q, [(0, 1001, atk, 0, ""), (1, 0, 0, wire_q, str(skill))]
+    # ONLY the rolled skill rides random_attri (skillId at field 4) — the
+    # client's weapon info panel lists every random_attri entry carrying a
+    # skillId, so a base-atk entry here would render as a second "attack"
+    # skill. The base attack is the weapon's EquipData BSValue atk: it is
+    # applied server-side from weapon_base_atk() and never sent as a
+    # random_attri entry.
+    return wire_q, [(0, 0, 0, wire_q, str(skill))]
 
 
 def roll_armor_instance(armor_id: int, rng=None):
     """(quality_wire, attrs) for a real armor piece.
 
-    Base attrs from the recovered EquipData row PLUS 1-2 random bonus stats
-    (count scales with tier: tier 1-2 -> 1 stat, tier 3+ -> 2 stats) rolled
-    from the dedicated random pool — the base status row never appears in
-    the random slots. The highest-quality random stat's quality gives the
-    piece its color. Attr entries are (index, attr_id, value, quality,
-    skillId) where index is the random slot 0..7.
+    The instance blob carries ONLY the 1-2 random bonus stats (tier 1-2 ->
+    1 stat, tier 3+ -> 2 stats). The base status row (HP/def/...) is NOT
+    included: the client reads the base attrs from its own EquipData table,
+    so anything else in random_attri renders as an extra random stat (that
+    is why pieces showed the basic status as a "random status"). The rolled
+    stats come from the real client attribute-id pool (1001..1007/1012/1013
+    per ATTR_POOLS), and the best roll's quality colors the piece.
     """
     import random as _random
     rng = rng or _random
     info = ARMOR_ITEMS.get(armor_id)
     if info is None:
         return 1, []
-    q = _roll_quality(rng)
     n_random = 2 if info.get("tier", 1) >= 3 else 1
-    # random bonus stats occupy the dedicated slots AFTER the base row
-    base = [(i, a, v, 0, "") for i, (a, v) in enumerate(info["base_attrs"])]
     rolls = roll_random_attrs(n_random, rng)
     best_q = 0
-    attrs = list(base)
-    for _slot, aid, val in rolls:
-        rq = _roll_quality(rng)
+    attrs = []
+    for slot, aid, val, rq in rolls:
         best_q = max(best_q, rq)
-        attrs.append((len(attrs), aid, val, QUALITY_WIRE[rq], ""))
-    # color by the best random stat's rarity (client EquipDrop rule)
-    return QUALITY_WIRE[best_q] if best_q else QUALITY_WIRE[q], attrs
+        attrs.append((slot, aid, val, QUALITY_WIRE[rq], ""))
+    if not attrs:
+        # fallback: one plain roll so the piece is never stat-less
+        aid, lo, hi = RANDOM_ATTR_POOL[0]
+        attrs = [(0, aid, rng.randint(lo, hi), QUALITY_WIRE[0], "")]
+    return QUALITY_WIRE[best_q], attrs
 
 
-# Random attribute roll ranges for freshly created gear (gameitem
-# random_attri entries): (attr_id, min, max). Attr ids follow the client's
-# ATTRIBUTE_TYPE ids; the character screen just lists whatever arrives.
-# The pool holds ONLY random bonus stats — the equipment's base status row
-# comes separately from base_attrs and must never appear as a random roll.
+# Random attribute roll pool for freshly created gear (gameitem
+# random_attri entries). Attr ids are the client's REAL attribute ids
+# (GetAttributeName_S / ATTRIBUTE_ICON): 1001 atk, 1002 hp, 1003 def,
+# 1004 hit, 1005 eva, 1006 cri, 1007 res, 1012/1013 = the percent stats
+# (value shown as value/10000 %). The pool holds ONLY random bonus stats —
+# the equipment's base status comes from the client's own EquipData row and
+# must never appear as a random roll.
 RANDOM_ATTR_POOL = [
-    (1, 5, 20),     # atk
-    (2, 5, 20),     # def
-    (3, 20, 100),   # hp
-    (4, 1, 5),      # hit
-    (5, 1, 5),      # eva
-    (6, 1, 3),      # cri
-    (7, 1, 3),      # res
-    (8, 1, 2),      # exd
+    (1001, 8, 40),      # atk
+    (1002, 50, 300),    # hp
+    (1003, 3, 20),      # def
+    (1004, 5, 40),      # hit
+    (1005, 3, 25),      # eva
+    (1006, 2, 18),      # cri
+    (1007, 2, 18),      # res
+    (1012, 100, 600),   # %stat (value/10000)
 ]
 # the gameitem random_attri array supports up to 8 bonus slots
 RANDOM_ATTR_SLOTS = 8
@@ -451,14 +498,17 @@ RANDOM_ATTR_SLOTS = 8
 def roll_random_attrs(count: int = 2, rng=None):
     """Roll `count` DISTINCT random attributes from RANDOM_ATTR_POOL.
 
-    Returns [(index, attr_id, value)] for gameitem.random_attri — index is
-    the random_attri SLOT (0..7), not the roll order.
+    Returns [(slot, attr_id, value, quality)] for gameitem.random_attri —
+    slot is the random_attri SLOT (0..7), quality is the roll's rarity
+    (0..3) which the client colors the stat line AND (best roll) the piece.
     """
     import random as _random
     rng = rng or _random
-    pool = rng.sample(RANDOM_ATTR_POOL, min(count, len(RANDOM_ATTR_POOL)))
-    return [(slot, aid, rng.randint(lo, hi))
-            for slot, (aid, lo, hi) in enumerate(pool)]
+    picked = rng.sample(RANDOM_ATTR_POOL, min(count, len(RANDOM_ATTR_POOL)))
+    out = []
+    for slot, (aid, lo, hi) in enumerate(picked):
+        out.append((slot, aid, rng.randint(lo, hi), _roll_quality(rng)))
+    return out
 # skills: real per-class skill groups from SkillData merged over the legacy
 # generic set
 SKILLS = {
@@ -521,13 +571,20 @@ def instance_combat_value(profession: int, instance: dict,
     idef = ITEMS.get(item_id, {})
     is_weapon = idef.get("slot") == 0 or "weapon_class" in idef
     total = 0.0
-    for idx, a in enumerate(instance.get("attrs", [])):
-        val = a[2] if len(a) > 2 else 0
-        if not val:
-            continue
-        if is_weapon and idx >= 1:
-            continue            # weapons: no random-attr combat contribution
-        total += val * _attr_weight(profession, a[1])
+    # base attrs (client EquipData row) — part of GetItemCombatVal
+    for aid, val in armor_base_attrs(item_id):
+        total += val * _attr_weight(profession, aid)
+    if not is_weapon:
+        # random rolls (client skips them for weapons: SubType == 0)
+        for a in instance.get("attrs", []):
+            val = a[2] if len(a) > 2 else 0
+            if val:
+                total += val * _attr_weight(profession, a[1])
+    else:
+        # the weapon's base atk comes from the EquipData row
+        atk = weapon_base_atk(item_id)
+        if atk:
+            total += atk * _attr_weight(profession, 1001)
     return int(total)
 
 
@@ -560,7 +617,9 @@ def weapon_skill_bonus(profession: int, instance: dict,
 def character_attributes(db, char_id: int, level: int,
                          profession: int) -> dict:
     """Final attribute map for a character: base + level growth + every
-    equipped instance's attrs + weapon skill bonus.
+    equipped piece's BASE attrs (client EquipData rows, server-side since
+    the instance blobs carry only random rolls) + every instance's random
+    rolls + the weapon skill bonus.
 
     Recomputed ONLY on the change events (equip/unequip/upgrade/chest/
     level-up) and persisted into characters.data — never at login.
@@ -571,8 +630,17 @@ def character_attributes(db, char_id: int, level: int,
         attrs[aid] = int(attrs[aid] * growth)
     total_power = 0.0
     for inst in db.list_equipped_instances(char_id):
-        total_power += instance_combat_value(profession, inst, inst["item_id"])
-        total_power += weapon_skill_bonus(profession, inst, inst["item_id"])
+        item_id = inst["item_id"]
+        total_power += instance_combat_value(profession, inst, item_id)
+        total_power += weapon_skill_bonus(profession, inst, item_id)
+        # base attrs of the piece (EquipData row) apply server-side
+        for aid, val in armor_base_attrs(item_id):
+            attrs[aid] = attrs.get(aid, 0) + val
+        # weapons: the base attack is the EquipData BSValue atk
+        w_atk = weapon_base_atk(item_id)
+        if w_atk:
+            attrs[1001] = attrs.get(1001, 0) + w_atk
+        # random rolls from the persisted instance
         for aid, val in instance_attrs(inst):
             attrs[aid] = attrs.get(aid, 0) + val
     # skills: each learned skill level adds a flat power tick (SkillData
@@ -584,6 +652,22 @@ def character_attributes(db, char_id: int, level: int,
                 * _attr_weight(profession, 1001) * 0.1
     attrs["power"] = int(total_power)
     return attrs
+
+
+def weapon_base_atk(item_id: int) -> int:
+    """The weapon's EquipData BSValue atk (server-side base attack)."""
+    w = ITEMS.get(item_id, {})
+    if w.get("slot") != 0 and "weapon_class" not in w:
+        return 0
+    return w.get("atk", 0) or w.get("power", 0) or 0
+
+
+def armor_base_attrs(item_id: int) -> list:
+    """[(attr_id, value)] base attrs of an armor piece from its recovered
+    EquipData row (ARMOR_ROWS), matching what the client displays as the
+    piece's base status."""
+    info = ARMOR_ITEMS.get(item_id)
+    return list(info["base_attrs"]) if info else []
 
 
 # --- character random status -------------------------------------------------

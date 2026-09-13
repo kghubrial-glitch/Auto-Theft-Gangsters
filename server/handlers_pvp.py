@@ -643,13 +643,17 @@ class PvpHandlersMixin:
             s.respond(msg, {0: 3})   # name taken
 
     async def h_change_show_type(self, s: Session, msg) -> None:
+        # change_show_type(223): {showType(0)} — the wardrobe Show/Hide
+        # toggle. Persist it (survives relogin) and broadcast the visual
+        # change so the model updates without a relog.
         row = self._require_char(s)
         if row is None:
             s.respond(msg, {0: 1})
             return
-        self.server.db.set_progress(row["id"], "show_type",
-                                    msg.body.get(0, 0))
+        show_type = 1 if msg.body.get(0, 0) else 0
+        self.server.db.set_progress(row["id"], "show_type", show_type)
         s.respond(msg, {0: 0})
+        self._sync_show_type(s, row["id"], show_type)
 
     async def h_impact_npc(self, s: Session, msg) -> None:
         """Client-side NPC interaction impact (dialog trigger); mirror it."""

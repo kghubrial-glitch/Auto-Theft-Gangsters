@@ -29,11 +29,11 @@ Localizations from the client string table:
 # value sent in character_create.general field 2 -> weapon class
 PROFESSIONS = {
     0: {"name": "Batfighter", "weapon_type": 0, "model": "XD",
-        "skills": [101, 102, 103, 104]},
+        "skills": [101, 102, 103, 104, 105, 106]},
     1: {"name": "Boxer", "weapon_type": 1, "model": "QJ",
-        "skills": [201, 202, 203, 204]},
+        "skills": [201, 202, 203, 204, 205, 206]},
     2: {"name": "Gunner", "weapon_type": 2, "model": "NQS",
-        "skills": [301, 302, 303, 304]},
+        "skills": [301, 302, 303, 304, 305, 306]},
 }
 
 # --- cars (real CarData rows) ------------------------------------------------
