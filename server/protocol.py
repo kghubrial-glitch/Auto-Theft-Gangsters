@@ -1464,8 +1464,12 @@ def encode_gameitem(index_id: int, item_id: int, stack: int = 1,
         6: quality,
     }
     if parm:
-        fields[7] = _enc.encode_object_array(
-            [_enc.encode_object({0: v}) for v in parm])
+        # parm(7) is List<long> on the client (gameitem.decode uses
+        # read_integer_list) -- encode as a packed integer array, NOT an
+        # object array (an object-array layout here throws
+        # "error array size(N)@sizeof(Uint32)" inside SprotoType.gameitem
+        # while decoding the character blob's item maps)
+        fields[7] = _enc.encode_integer_array([int(v) for v in parm])
     if random_attris:
         stat_quality = None
         attr_blobs = []
