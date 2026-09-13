@@ -1154,7 +1154,8 @@ def encode_item_stack(item_id: int, count: int, index_id: int = None) -> bytes:
     return _enc.encode_object({0: item_id, 1: count})
 
 
-def encode_backpack_gameitem(char_id_row, instance=None) -> bytes:
+def encode_backpack_gameitem(char_id_row, instance=None,
+                             seen: int = 1) -> bytes:
     """Backpack/fashion/badge container element: a FULL gameitem blob.
 
     sync_backpack_item et al. decode map<indexId, gameitem> and only update
@@ -1165,6 +1166,9 @@ def encode_backpack_gameitem(char_id_row, instance=None) -> bytes:
 
     `char_id_row` is a db item row {item_id, count}; `instance` optionally
     carries a persisted rolled instance (quality/attrs/level/index_id).
+    `seen` drives gameitem.parm[5] — the client's "new item" flag (0=new).
+    Persisted/known items must send seen=1 or every re-sync (including the
+    re-add after unequip) makes the item look freshly acquired again.
     """
     from . import economy
     item_id = char_id_row["item_id"]
@@ -1174,17 +1178,23 @@ def encode_backpack_gameitem(char_id_row, instance=None) -> bytes:
     except (KeyError, IndexError):
         count = 1
     idef = economy.ITEMS.get(item_id, {})
+    # parm[5]=1 -> not new; the client's NewflagSprite / NewItemTips honor
+    # this bit, and re-syncing a "new" item resets it locally.
+    parm = [0, 0, 0, 0, 0, (0 if not seen else 1), 0, 0]
     if instance is not None:
         attrs = [(a[0], a[1], a[2], a[3], str(a[4]) if len(a) > 4 and a[4]
                   else "") for a in instance.get("attrs", [])]
         return encode_gameitem(instance["index_id"], item_id, stack=1,
                                quality=instance["quality"],
-                               level=instance["level"], random_attris=attrs)
+                               level=instance["level"], random_attris=attrs,
+                               parm=parm)
     if idef.get("type") == "equipment" and item_id in economy.ARMOR_ITEMS:
         # armor without a rolled instance yet: plain quality, no attrs
-        return encode_gameitem(item_id, item_id, stack=1, quality=1)
+        return encode_gameitem(item_id, item_id, stack=1, quality=1,
+                               parm=parm)
     quality = 2 if idef.get("type") == "equipment" else 0
-    return encode_gameitem(item_id, item_id, stack=count, quality=quality)
+    return encode_gameitem(item_id, item_id, stack=count, quality=quality,
+                           parm=parm)
 
 
 def encode_acceptdamge(obj_id: int, damage: int, skill_id: str = "1",
@@ -1381,7 +1391,9 @@ def encode_npc(npc_id: int, kind: int, level: int, hp: int, max_hp: int,
 
 def encode_aoi_update_attribute(char_id: int, hp: int, exp: int,
                                 level: int, max_hp: int, gold: int = 0,
-                                diamond: int = 0, attrs: dict = None,
+                                diamond: int = 0,
+                                cash: int = None,
+                                attrs: dict = None,
                                 comb_value: int = None) -> bytes:
     """SprotoType.aoi_update_attribute.request {character(0)} where character
     is a character_aoi_attribute blob: id(0) attribute_other(1) attribute(2)
@@ -1389,7 +1401,16 @@ def encode_aoi_update_attribute(char_id: int, hp: int, exp: int,
     the client applies MaxHP/HP/level/exp (UpdateExp) and money for the main
     player — this is the real post-kill attribute sync (NOT sync_common_data,
     whose tag 0 is serverTime on the client!).
+
+    property carries money1..money6 at tags 13..18; the client maps them to
+    Cash/Gold/Diamond/GuildContribute/BattleCoin/ActivityCoin
+    (GameMoneyHelper.UpdateMoney). When `cash` is omitted it falls back to
+    gold so existing callers keep working during the migration.
     """
+    # client property tags: 13=money1(Cash) 14=money2(Gold)
+    # 15=money3(Diamond) 16=money4(GuildContribute)
+    if cash is None:
+        cash = gold  # legacy default: keep old behavior when caller didn't
     if attrs:
         # real recalculated attribute set (persisted on change events):
         # attribute_other.combValue (field 3) carries the server power so
@@ -1422,8 +1443,8 @@ def encode_aoi_update_attribute(char_id: int, hp: int, exp: int,
         0: char_id,
         1: attribute_other,
         2: attribute,
-        # property: 13=money1 CASH, 14=money2 GOLD, 15=money3 DIAMOND
-        5: _enc.encode_object({14: gold, 15: diamond}),
+        # money1=Cash, money2=Gold, money3=Diamond
+        5: _enc.encode_object({13: cash, 14: gold, 15: diamond}),
     })
     return _enc.encode_object({0: character})
 
@@ -1437,8 +1458,7 @@ def encode_gameitem(index_id: int, item_id: int, stack: int = 1,
                     quality: int = 2, level: int = 0,
                     bind: bool = True,
                     random_attris: list = None,
-                    parm: list = None,
-                    appraise: int = None) -> bytes:
+                    parm: list = None) -> bytes:
     """SprotoType.gameitem, the REAL inventory element (decode() switch):
     indexId(0) i, itemId(1) STRING, bindflag(2) b, level(3) i, flags(4) i,
     stack(5) i, quality(6) i, parm(7) int-list, appraise(8) i,
@@ -1465,15 +1485,6 @@ def encode_gameitem(index_id: int, item_id: int, stack: int = 1,
         5: stack,
         6: quality,
     }
-    if appraise is None:
-        # default: 1 for equipment (appraised/unlocked -- GameItem.IsAppraise
-        # gates equip/use; absent/0 renders the piece as "needs appraise",
-        # which the bag shows as LOCKED), 0 for everything else
-        from . import economy as _economy
-        appraise = 1 if _economy.ITEMS.get(item_id, {}).get(
-            "type") == "equipment" else 0
-    if appraise:
-        fields[8] = appraise
     if parm:
         # parm(7) is List<long> on the client (gameitem.decode uses
         # read_integer_list) -- encode as a packed integer array, NOT an

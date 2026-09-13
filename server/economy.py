@@ -27,6 +27,7 @@ MAIN_CITY_MAP = "11"
 TEST_MAX_LEVEL = 80
 TEST_START_GOLD = 99_999_999
 TEST_START_DIAMOND = 999_999
+TEST_START_CASH = 99_999_999
 
 # --- items -----------------------------------------------------------------
 # item_id -> {"name", "type", "slot", "price"(gold), "power"}
@@ -171,6 +172,7 @@ SHOPS = {
     },
 }
 
+CURRENCY_CASH = 0
 CURRENCY_GOLD = 1
 CURRENCY_DIAMOND = 2
 
