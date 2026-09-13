@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS characters (
     car_id      INTEGER,
     using_car   INTEGER NOT NULL DEFAULT 0,
     diamond     INTEGER NOT NULL DEFAULT 20,
+    cash        INTEGER NOT NULL DEFAULT 0,
     -- map 1 is the client's LoadingScene placeholder; the real main city is 11
     map_id      TEXT NOT NULL DEFAULT '11',
     pos_x       INTEGER NOT NULL DEFAULT 0,
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS items (
     char_id     INTEGER NOT NULL REFERENCES characters(id),
     item_id     INTEGER NOT NULL,
     count       INTEGER NOT NULL DEFAULT 1,
+    seen        INTEGER NOT NULL DEFAULT 1,   -- 0 = "new" (Parm[5]==0)
     UNIQUE(char_id, item_id)
 );
 
@@ -210,6 +212,16 @@ class Database:
         if "diamond" not in cols:
             self._conn.execute(
                 "ALTER TABLE characters ADD COLUMN diamond INTEGER NOT NULL DEFAULT 20")
+        if "cash" not in cols:
+            self._conn.execute(
+                "ALTER TABLE characters ADD COLUMN cash INTEGER NOT NULL DEFAULT 0")
+        # migrate pre-seen databases: every existing stack is "seen" (the
+        # new-flag only ever applies to items granted AFTER this migration)
+        icols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(items)")}
+        if "seen" not in icols:
+            self._conn.execute(
+                "ALTER TABLE items ADD COLUMN seen INTEGER NOT NULL DEFAULT 1")
         if "profession" not in cols:
             self._conn.execute(
                 "ALTER TABLE characters ADD COLUMN profession INTEGER"
@@ -306,11 +318,13 @@ class Database:
             )
             # Testing build: maxed starting wallets (TEST_START_GOLD /
             # TEST_START_DIAMOND from economy) land in the currency columns.
-            if extra.get("gold") or extra.get("diamond"):
+            if extra.get("cash") or extra.get("gold") or extra.get("diamond"):
                 self._conn.execute(
-                    "UPDATE characters SET gold = COALESCE(gold, 0) + ?,"
+                    "UPDATE characters SET cash = COALESCE(cash, 0) + ?,"
+                    " gold = COALESCE(gold, 0) + ?,"
                     " diamond = COALESCE(diamond, 0) + ? WHERE id = ?",
-                    (int(extra.get("gold") or 0),
+                    (int(extra.get("cash") or 0),
+                     int(extra.get("gold") or 0),
                      int(extra.get("diamond") or 0), cur.lastrowid),
                 )
             self._conn.commit()
@@ -334,8 +348,12 @@ class Database:
         self._conn.commit()
 
     # -- currency -------------------------------------------------------
+    # currency constants (economy.CURRENCY_*): 0 cash, 1 gold, 2 diamond —
+    # the client's property money1/2/3 mapping.
+    CURRENCY_COLUMNS = {0: "cash", 1: "gold", 2: "diamond"}
+
     def get_currency(self, char_id: int, currency: int) -> int:
-        col = "gold" if currency == 1 else "diamond"
+        col = self.CURRENCY_COLUMNS.get(currency, "gold")
         row = self._conn.execute(
             "SELECT %s AS v FROM characters WHERE id = ?" % col, (char_id,)
         ).fetchone()
@@ -343,7 +361,7 @@ class Database:
 
     def add_currency(self, char_id: int, currency: int, amount: int) -> int:
         """Add (or spend, negative amount) currency; returns the new balance."""
-        col = "gold" if currency == 1 else "diamond"
+        col = self.CURRENCY_COLUMNS.get(currency, "gold")
         bal = self.get_currency(char_id, currency)
         new_bal = max(0, bal + amount)
         self._conn.execute(
@@ -355,7 +373,8 @@ class Database:
     # -- items / backpack -----------------------------------------------
     def list_items(self, char_id: int):
         return self._conn.execute(
-            "SELECT item_id, count FROM items WHERE char_id = ? ORDER BY item_id",
+            "SELECT item_id, count, seen FROM items WHERE char_id = ?"
+            " ORDER BY item_id",
             (char_id,),
         ).fetchall()
 
@@ -366,22 +385,54 @@ class Database:
         ).fetchone()
         return row["count"] if row else 0
 
-    def add_item(self, char_id: int, item_id: int, count: int) -> int:
-        """Add `count` of `item_id` to the backpack; returns the new count."""
-        new = max(0, self.get_item_count(char_id, item_id) + count)
+    def add_item(self, char_id: int, item_id: int, count: int,
+                 seen: int = None) -> int:
+        """Add `count` of `item_id` to the backpack; returns the new count.
+
+        A stack created FROM ZERO is marked "new" (seen=0) so the client
+        shows the new-item flag and the player can acknowledge it with
+        change_item_state(240). Pass `seen=1` for starting grants (they must
+        not appear as freshly-acquired). Already-seen stacks keep their flag.
+        """
+        have = self.get_item_count(char_id, item_id)
+        new = max(0, have + count)
         if new == 0:
             self._conn.execute(
                 "DELETE FROM items WHERE char_id = ? AND item_id = ?",
                 (char_id, item_id),
             )
+        elif have == 0:
+            new_seen = 0 if seen is None else (1 if seen else 0)
+            self._conn.execute(
+                "INSERT INTO items (char_id, item_id, count, seen)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(char_id, item_id) DO UPDATE SET count = ?",
+                (char_id, item_id, new, new_seen, new),
+            )
         else:
             self._conn.execute(
-                "INSERT INTO items (char_id, item_id, count) VALUES (?, ?, ?)"
+                "INSERT INTO items (char_id, item_id, count)"
+                " VALUES (?, ?, ?)"
                 " ON CONFLICT(char_id, item_id) DO UPDATE SET count = ?",
                 (char_id, item_id, new, new),
             )
         self._conn.commit()
         return new
+
+    def get_item_seen(self, char_id: int, item_id: int) -> int:
+        row = self._conn.execute(
+            "SELECT seen FROM items WHERE char_id = ? AND item_id = ?",
+            (char_id, item_id),
+        ).fetchone()
+        return row["seen"] if row else 1
+
+    def mark_item_seen(self, char_id: int, item_id: int) -> None:
+        """Record that the player acknowledged an item (new-flag cleared)."""
+        self._conn.execute(
+            "UPDATE items SET seen = 1 WHERE char_id = ? AND item_id = ?",
+            (char_id, item_id),
+        )
+        self._conn.commit()
 
     # -- missions ---------------------------------------------------------
     def list_missions(self, char_id: int):

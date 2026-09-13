@@ -321,8 +321,11 @@ def _attribute_other_blob(hp: int, exp: int, level: int,
     })
 
 
-def _property_blob(gold: int = 0, diamond: int = 0) -> bytes:
-    return P._enc.encode_object({13: gold, 14: diamond, 15: 0, 16: 0,
+def _property_blob(cash: int = 0, gold: int = 0,
+                   diamond: int = 0) -> bytes:
+    """SprotoType.property: money1(13)=Cash money2(14)=Gold
+    money3(15)=Diamond money4..6=Guild/Battle/Activity (0)."""
+    return P._enc.encode_object({13: cash, 14: gold, 15: diamond, 16: 0,
                                  17: 0, 18: 0})
 
 
@@ -353,7 +356,8 @@ def encode_character_blob(char_id: int, name: str, level: int,
                           show_type: int = 0,
                           fashion_parts: tuple = None,
                           weapon_item_id: str = None,
-                          fashion_item_id: str = None) -> bytes:
+                          fashion_item_id: str = None,
+                          cash: int = None) -> bytes:
     """Full SprotoType.character blob for main_player_create.
 
     The client's ObjInitPlayerData.InitData(character) hard-dereferences
@@ -380,7 +384,8 @@ def encode_character_blob(char_id: int, name: str, level: int,
         0: char_id,
         1: _general_blob(name, profession, line_index, map_id),
         2: _attribute_other_blob(hp, exp, level, comb_value),
-        5: _property_blob(gold, diamond),
+        5: _property_blob(cash if cash is not None else gold,
+                          gold, diamond),
         6: _visual_blob(profession, name, show_type,
                         fashion_parts=fashion_parts,
                         weapon_item_id=weapon_item_id,
@@ -526,7 +531,10 @@ def encode_main_player_create(player: WorldPlayer,
                               hp: int = None,
                               badge_equips: list = None,
                               fashion_equips: list = None,
-                              show_type: int = 0) -> dict:
+                              show_type: int = 0,
+                              cash: int = None,
+                              gold: int = None,
+                              diamond: int = None) -> dict:
     """Field dict for the main_player_create PUSH body:
     {character(0), movement(1)}.
 
@@ -553,7 +561,10 @@ def encode_main_player_create(player: WorldPlayer,
         fashion_equips=fashion_equips, show_type=show_type,
         fashion_parts=getattr(player, "fashion_parts", None),
         weapon_item_id=getattr(player, "weapon_item_id", None),
-        fashion_item_id=getattr(player, "fashion_item_id", None))
+        fashion_item_id=getattr(player, "fashion_item_id", None),
+        cash=0 if cash is None else cash,
+        gold=0 if gold is None else gold,
+        diamond=0 if diamond is None else diamond)
     return {
         0: character,
         1: player.movement_blob(),
